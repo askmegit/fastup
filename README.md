@@ -6,7 +6,7 @@ macOS only in v0.1. Bash 3.2 compatible. Needs `curl`, `shasum`, `tar`, `openssl
 
 ## Install
 
-Homebrew:
+Homebrew (available once the tap is published):
 
 ```bash
 brew install askmegit/tap/fastup
@@ -29,8 +29,9 @@ fastup all                      # update everything that is installed
 fastup claude codex             # update specific tools
 fastup --check all              # report only; exit 10 if any update is available
 fastup --dry-run -v omp         # show the plan and probe speeds, install nothing
-fastup --via https://gh-proxy.com/ omp     # use only this prefix (plus the official URL), skip probing
-fastup --force agy              # reinstall or downgrade
+fastup --via https://gh-proxy.com/ omp     # GitHub downloads: try this prefix first, then the official URL; no probing
+fastup --force agy              # reinstall, downgrade, or repair a broken binary
+fastup --version
 ```
 
 Exit codes:
@@ -43,11 +44,13 @@ Exit codes:
 | 3 | Unsupported install layout (see below) |
 | 10 | Update available (`--check`) |
 
+With several CLIs, the most severe code wins: 1, then 3, then 10, then 0.
+
 ## How it works
 
 1. Probe: for each candidate source, download the first `FASTUP_PROBE_BYTES` (2 MiB) in parallel and time it.
 2. Rank: order sources by measured speed.
-3. Fetch: download from the fastest; on a stall (`FASTUP_STALL_TIME`) or error, resume the partial file from the next source.
+3. Fetch: download from the fastest; if it stays below a quarter of its probed speed for `FASTUP_STALL_TIME` seconds, or errors, resume the partial file from the next source. Downloads are capped at `FASTUP_MAX_BYTES`.
 4. Verify: compare the SHA-256 / SHA-512 of the result with the checksum fetched from the official host. A mismatch discards the file and moves on to the next source.
 5. Install atomically: swap the new version in place; if anything fails, roll back to the previous one.
 
@@ -85,6 +88,7 @@ Exit 3 means the tool was found but installed some other way (Homebrew, npm, ...
 | `FASTUP_PROBE_PARALLEL` | Concurrent probes | 3 |
 | `FASTUP_STALL_TIME` | Seconds below a quarter of the probed speed (min 1 KiB/s) before switching source | 30 |
 | `GITHUB_TOKEN` | Sent to `api.github.com` only (rate limits); `gh` is used instead when logged in | unset |
+| `FASTUP_MAX_BYTES` | Refuse downloads larger than this | 1073741824 (1 GiB) |
 | `FASTUP_STATE` | State and partial-download directory | `~/.cache/fastup` |
 
 ## Limitations
