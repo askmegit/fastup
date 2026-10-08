@@ -21,12 +21,13 @@ curl -fsSL https://raw.githubusercontent.com/askmegit/fastup/main/install.sh | b
 ## Usage
 
 ```
-fastup [--check] [--force] [--via PREFIX] [--dry-run] [-v] <claude|codex|omp|agy|all>...
+fastup [--check] [--force] [--via PREFIX] [--dry-run] [-v] <claude|codex|omp|agy|self|all>...
 ```
 
 ```bash
 fastup all                      # update everything that is installed
 fastup claude codex             # update specific tools
+fastup self                     # update fastup itself (not part of `all`; Homebrew: brew upgrade fastup)
 fastup --check all              # report only; exit 10 if any update is available
 fastup --dry-run -v omp         # show the plan and probe speeds, install nothing
 fastup --via https://gh-proxy.com/ omp     # GitHub downloads: try this prefix first, then the official URL; no probing

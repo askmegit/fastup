@@ -3,7 +3,9 @@ FASTUP_VERSION=0.1.0
 
 fastup_usage() {
   cat <<'USAGE'
-Usage: fastup [options] <claude|codex|omp|agy|all>...
+Usage: fastup [options] <claude|codex|omp|agy|self|all>...
+
+self updates fastup itself from its latest release (Homebrew installs: use brew upgrade fastup).
 
 Options:
   --check          Report available updates without installing (exit 10 if available)
@@ -466,7 +468,7 @@ fastup_main() {
       --via=*) via="${1#--via=}"; [ -n "$via" ] || { fastup_usage >&2; return 2; } ;;
       --*) fastup_usage >&2; return 2 ;;
       -*) fastup_usage >&2; return 2 ;;
-      claude|codex|omp|agy|all) names[${#names[@]}]="$1" ;;
+      claude|codex|omp|agy|self|all) names[${#names[@]}]="$1" ;;
       *) fastup_usage >&2; return 2 ;;
     esac
     shift
@@ -900,6 +902,66 @@ codex_install() {
   fi
   printf 'codex: updated %s -> %s\n' "${current:-unknown}" "$new"
 }
+
+self_detect() {
+  SELF_TARGET="$(fastup_resolve_path "${BASH_SOURCE[0]:-$0}")" || { fastup_native_unsupported self "cannot resolve $0"; return 3; }
+  case "$SELF_TARGET" in
+    */Cellar/*) printf 'fastup: installed by Homebrew; run: brew upgrade fastup\n' >&2; return 3 ;;
+  esac
+  [ -w "${SELF_TARGET%/*}" ] || { fastup_native_unsupported self "${SELF_TARGET%/*} is not writable"; return 3; }
+}
+
+self_current() { printf '%s\n' "$FASTUP_VERSION"; }
+
+self_resolve() {
+  local api api_host metadata tag digest url index name
+  api="${FASTUP_SELF_API:-https://api.github.com/repos/askmegit/fastup/releases/latest}"
+  api_host="${api#*://}"
+  api_host="${api_host%%/*}"
+  api_host="${api_host%%:*}"
+  if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1 &&
+    metadata="$(gh api repos/askmegit/fastup/releases/latest 2>/dev/null)"; then :
+  elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+    metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || { fastup_resolve_error self 'cannot fetch release metadata'; return 1; }
+  else
+    metadata="$(curl -fsSL "$api")" || { fastup_resolve_error self 'cannot fetch release metadata'; return 1; }
+  fi
+  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || { fastup_resolve_error self 'release metadata has no tag'; return 1; }
+  case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fastup_resolve_error self "unexpected release tag $tag"; return 1 ;; esac
+  index=0
+  digest=; url=
+  while :; do
+    name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
+    if [ "$name" = fastup ]; then
+      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || { fastup_resolve_error self 'asset fastup has no checksum'; return 1; }
+      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || { fastup_resolve_error self 'asset fastup has no download URL'; return 1; }
+      break
+    fi
+    index=$((index + 1))
+  done
+  case "${digest:-}" in sha256:*) digest="${digest#sha256:}" ;; *) fastup_resolve_error self "release $tag has no checksum for fastup"; return 1 ;; esac
+  case "$digest" in ????????????????????????????????????????????????????????????????) ;; *) fastup_resolve_error self 'invalid checksum for fastup'; return 1 ;; esac
+  case "$digest" in *[!0-9a-f]*) fastup_resolve_error self 'invalid checksum for fastup'; return 1 ;; esac
+  [ -n "${url:-}" ] || { fastup_resolve_error self "release $tag has no asset fastup"; return 1; }
+  LATEST="${tag#v}"
+  CANDIDATES="$(gh_candidates "$url" sha256 "$digest" raw)" || { fastup_resolve_error self 'cannot build candidates for fastup'; return 1; }
+}
+
+self_install() {
+  local payload="$1" tmp
+  [ "$("$BASH" "$payload" --version 2>/dev/null)" = "fastup $LATEST" ] || {
+    printf 'self: downloaded script does not report version %s\n' "$LATEST" >&2; return 1;
+  }
+  tmp="$(mktemp "${SELF_TARGET%/*}/.fastup.XXXXXX")" || { printf 'self: cannot create temp file in %s\n' "${SELF_TARGET%/*}" >&2; return 1; }
+  if cp "$payload" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$SELF_TARGET"; then
+    printf 'self: updated %s -> %s\n' "$FASTUP_VERSION" "$LATEST"
+  else
+    rm -f "$tmp"
+    printf 'self: cannot replace %s\n' "$SELF_TARGET" >&2
+    return 1
+  fi
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fastup_main "$@"
   exit $?
