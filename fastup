@@ -451,6 +451,7 @@ fastup_record_rc() {
 fastup_main() {
   local check=0 force=0 dry=0 verbose=0 via='' cli rc max_rc=0 name
   local -a names
+  local self_last=0
   names=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -468,18 +469,24 @@ fastup_main() {
       --via=*) via="${1#--via=}"; [ -n "$via" ] || { fastup_usage >&2; return 2; } ;;
       --*) fastup_usage >&2; return 2 ;;
       -*) fastup_usage >&2; return 2 ;;
-      claude|codex|omp|agy|self|all) names[${#names[@]}]="$1" ;;
+      self) self_last=1 ;;
+      claude|codex|omp|agy|all) names[${#names[@]}]="$1" ;;
       *) fastup_usage >&2; return 2 ;;
     esac
     shift
   done
-  [ "${#names[@]}" -gt 0 ] || { fastup_usage >&2; return 2; }
+  [ "${#names[@]}" -gt 0 ] || [ "$self_last" = 1 ] || { fastup_usage >&2; return 2; }
   [ "$check" -eq 0 ] || FASTUP_CHECK=1
   [ "$force" -eq 0 ] || FASTUP_FORCE=1
   [ "$dry" -eq 0 ] || FASTUP_DRY_RUN=1
   [ "$verbose" -eq 0 ] || FASTUP_VERBOSE=1
   [ -z "$via" ] || FASTUP_VIA="$via"
-  for name in "${names[@]}"; do
+  # self runs last: it replaces this script, and later CLIs (codex re-sources it) must not see a newer copy.
+  for name in "${names[@]}" self; do
+    if [ "$name" = self ]; then
+      [ "$self_last" = 1 ] || continue
+      self_last=0
+    fi
     if [ "$name" = all ]; then
       for cli in claude codex omp agy; do
         fastup_update_one "$cli"
@@ -908,6 +915,7 @@ self_detect() {
   case "$SELF_TARGET" in
     */Cellar/*) printf 'fastup: installed by Homebrew; run: brew upgrade fastup\n' >&2; return 3 ;;
   esac
+  [ ! -e "${SELF_TARGET%/*}/.git" ] || { fastup_native_unsupported self "${SELF_TARGET%/*} is a git checkout; use git pull"; return 3; }
   [ -w "${SELF_TARGET%/*}" ] || { fastup_native_unsupported self "${SELF_TARGET%/*} is not writable"; return 3; }
 }
 
@@ -920,7 +928,7 @@ self_resolve() {
   api_host="${api_host%%/*}"
   api_host="${api_host%%:*}"
   if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1 &&
-    metadata="$(gh api repos/askmegit/fastup/releases/latest 2>/dev/null)"; then :
+    metadata="$(gh api --hostname github.com "${api#*://api.github.com/}" 2>/dev/null)"; then :
   elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
     metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || { fastup_resolve_error self 'cannot fetch release metadata'; return 1; }
   else
