@@ -340,7 +340,7 @@ fastup_version_gt() {
 }
 
 fastup_update_one() {
-  local cli="$1" current rc payload
+  local cli="$1" current rc payload work
   local detect_fn="${cli}_detect" current_fn="${cli}_current" resolve_fn="${cli}_resolve" install_fn="${cli}_install"
   if ! command -v "$detect_fn" >/dev/null 2>&1 || ! command -v "$current_fn" >/dev/null 2>&1 ||
       ! command -v "$resolve_fn" >/dev/null 2>&1 || ! command -v "$install_fn" >/dev/null 2>&1; then
@@ -373,12 +373,20 @@ fastup_update_one() {
     lock_release "$cli"
     return 0
   fi
-  payload="$(printf '%s\n' "${CANDIDATES:-}" | probe | fetch_verified "${FASTUP_STATE:-$HOME/.cache/fastup}/payload/$cli")" || {
+  # The payload (a copy of the whole download) lives only for this run.
+  if ! mkdir -p "${FASTUP_STATE:-$HOME/.cache/fastup}" ||
+    ! work="$(mktemp -d "${FASTUP_STATE:-$HOME/.cache/fastup}/payload.XXXXXX")"; then
+    lock_release "$cli"
+    return 1
+  fi
+  payload="$(printf '%s\n' "${CANDIDATES:-}" | probe | fetch_verified "$work")" || {
+    rm -rf "$work"
     lock_release "$cli"
     return 1
   }
   "$install_fn" "$payload"
   rc=$?
+  rm -rf "$work"
   lock_release "$cli"
   return "$rc"
 }
@@ -479,8 +487,10 @@ omp_resolve() {
   api_host="${api#*://}"
   api_host="${api_host%%/*}"
   api_host="${api_host%%:*}"
-  if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1; then
-    metadata="$(gh api repos/can1357/oh-my-pi/releases/latest)" || return 1
+  # gh may be installed but logged out; fall through to curl then.
+  if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1 &&
+    metadata="$(gh api repos/can1357/oh-my-pi/releases/latest 2>/dev/null)"; then
+    :
   elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
     metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || return 1
   else
@@ -565,9 +575,10 @@ fastup_native_install() {
     return 1
   fi
   backup="$target.fastup-bak"
-  if ! mv -f "$target" "$backup"; then rm -f "$tmp"; return 1; fi
+  # Hard-link the backup so the target path never disappears; the mv below replaces it atomically.
+  if ! ln -f "$target" "$backup"; then rm -f "$tmp"; return 1; fi
   if ! mv -f "$tmp" "$target"; then
-    mv -f "$backup" "$target"
+    rm -f "$tmp" "$backup"
     return 1
   fi
   reported="$("$target" --version 2>/dev/null)" || reported=

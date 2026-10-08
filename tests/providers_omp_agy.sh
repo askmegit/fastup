@@ -174,3 +174,13 @@ t_all_returns_worst_code() {
   [ $rc -eq 3 ] && [ "$("$BIN/omp" --version)" = "omp/18.8.4" ] && ok all_returns_worst_code ||
     bad all_returns_worst_code "rc=$rc (want 3; omp must still be updated)"
 }
+
+t_no_payload_left_behind() {
+  omp_release v18.8.4 "$BASE/omp/$OMP_ASSET" "$OMP_NEW256"
+  fake_install omp "omp/18.8.3"
+  st="$(mktemp -d "$WORK/st.XXXXXX")"
+  FASTUP_STATE="$st" fu omp >/dev/null 2>&1; rc=$?
+  left="$(find "$st" -type f 2>/dev/null | grep -v '/locks/' | grep -c .)"
+  [ $rc -eq 0 ] && [ "$left" = 0 ] && ok no_payload_left_behind ||
+    bad no_payload_left_behind "rc=$rc, files left under FASTUP_STATE: $(find "$st" -type f | head -3)"
+}
