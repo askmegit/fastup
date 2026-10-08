@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+FASTUP_VERSION=0.1.0
 
 fastup_usage() {
   cat <<'USAGE'
@@ -10,6 +11,7 @@ Options:
   --via PREFIX     Use PREFIX for accelerated download candidates
   --dry-run        Show planned updates without installing
   -v               Print probe speeds
+  --version        Print the fastup version
   -h, --help       Show this help
 USAGE
 }
@@ -26,17 +28,17 @@ EOF
   # A plain pipe (not >(...)) so the body is fully written before it is counted; %{stderr} keeps
   # the write-out stats apart from the body.
   curl -L -r "0-$((bytes - 1))" --max-time "$timeout" -sS -D "$headers" \
-    -w '%{stderr}\n%{http_code}\t%{content_type}\t%{time_total}\t%{time_starttransfer}' \
+    -w '%{stderr}\n%{http_code}|%{content_type}|%{time_total}|%{time_starttransfer}' \
     -o - "$url" 2>"$dir/meta.$index" | head -c "$bytes" >"$body"
   rc=${PIPESTATUS[0]}
   meta="$(tail -n 1 "$dir/meta.$index")"
-  IFS=$'\t' read -r status content_type total_time start_time <<EOF
+  IFS='|' read -r status content_type total_time start_time <<EOF
 $meta
 EOF
   count=0
   [ -f "$body" ] && count="$(wc -c <"$body" | tr -d ' ')"
   file_size="$(tr '[:upper:]' '[:lower:]' <"$headers" 2>/dev/null | awk '
-    /^content-range:/ { split($3, p, "/"); if (p[2] ~ /^[0-9]+$/) total=p[2] }
+    /^content-range:/ { split($3, p, "/"); gsub("\\r", "", p[2]); if (p[2] ~ /^[0-9]+$/) total=p[2] }
     /^content-length:/ { clen=$2; gsub("\\r", "", clen) }
     END { if (total != "") print total; else if (clen != "") print clen; else print 0 }
   ')"
@@ -65,7 +67,7 @@ probe() {
     cat
     return 0
   fi
-  local bytes timeout parallel state dir line count index batch pid tab
+  local bytes timeout parallel state dir line count index batch tab
   local -a candidates pids
   bytes="${FASTUP_PROBE_BYTES:-2097152}"
   timeout="${FASTUP_PROBE_TIMEOUT:-6}"
@@ -76,6 +78,9 @@ probe() {
   state="${FASTUP_STATE:-$HOME/.cache/fastup}"
   mkdir -p "$state" || return 1
   dir="$(mktemp -d "$state/probe.XXXXXX")" || return 1
+  FASTUP_PROBE_DIR="$dir"
+  trap 'rm -rf "$FASTUP_PROBE_DIR"; exit 130' INT
+  trap 'rm -rf "$FASTUP_PROBE_DIR"; exit 143' TERM
   count=0
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
@@ -104,6 +109,7 @@ probe() {
   fi
   rm -f "$dir"/headers.* "$dir"/body.* "$dir"/meta.* "$dir"/result.*
   rmdir "$dir"
+  trap - INT TERM
 }
 
 fastup_hash_file() {
@@ -133,10 +139,11 @@ EOF
 }
 
 fastup_symlinks_safe() {
-  local root="$1" link target rel parent depth component old_ifs
+  local root="$1" link target rel parent depth component old_ifs restore_glob=0
+  case $- in *f*) ;; *) restore_glob=1; set -f ;; esac
   while IFS= read -r link; do
-    target="$(readlink "$link")" || return 1
-    case "$target" in /*) return 1 ;; esac
+    target="$(readlink "$link")" || { [ "$restore_glob" -eq 0 ] || set +f; return 1; }
+    case "$target" in /*) [ "$restore_glob" -eq 0 ] || set +f; return 1 ;; esac
     rel="${link#"$root"/}"
     parent="${rel%/*}"
     depth=0
@@ -147,10 +154,11 @@ fastup_symlinks_safe() {
     done
     for component in $target; do
       case "$component" in ''|.) ;; ..) depth=$((depth - 1)) ;; *) depth=$((depth + 1)) ;; esac
-      [ "$depth" -ge 0 ] || { IFS="$old_ifs"; return 1; }
+      [ "$depth" -ge 0 ] || { IFS="$old_ifs"; [ "$restore_glob" -eq 0 ] || set +f; return 1; }
     done
     IFS="$old_ifs"
   done < <(find "$root" -type l -print)
+  [ "$restore_glob" -eq 0 ] || set +f
   return 0
 }
 
@@ -186,8 +194,9 @@ fetch_verified() {
     min_speed=$((speed / 4))
     [ "$min_speed" -ge 1024 ] || min_speed=1024
     # A complete partial left by an earlier run would make `curl -C -` fail with 416, so check it first.
+    max_bytes="${FASTUP_MAX_BYTES:-1073741824}"
     if { [ -f "$partial" ] && [ "$(fastup_hash_file "$partial" "$algo")" = "$digest" ]; } ||
-      curl -fL -C - --retry 2 --speed-limit "$min_speed" --speed-time "$stall" -o "$partial" "$url"; then
+      curl -fL -C - --max-filesize "$max_bytes" --speed-limit "$min_speed" --speed-time "$stall" -o "$partial" "$url"; then
       actual="$(fastup_hash_file "$partial" "$algo")" || actual=
       if [ "$actual" != "$digest" ]; then
         printf 'fastup: checksum mismatch for %s\n' "$url" >&2
@@ -234,11 +243,12 @@ fetch_verified() {
 gh_candidates() {
   [ "$#" -eq 4 ] || return 2
   local url="$1" algo="$2" digest="$3" format="$4" prefixes prefix index
-  printf '%s\t%s\t%s\t%s\n' "$url" "$algo" "$digest" "$format"
   if [ -n "${FASTUP_VIA:-}" ]; then
     printf '%s\t%s\t%s\t%s\n' "${FASTUP_VIA}${url}" "$algo" "$digest" "$format"
+    printf '%s\t%s\t%s\t%s\n' "$url" "$algo" "$digest" "$format"
     return 0
   fi
+  printf '%s\t%s\t%s\t%s\n' "$url" "$algo" "$digest" "$format"
   if [ "${FASTUP_GH_PROXIES+x}" = x ]; then
     prefixes="$FASTUP_GH_PROXIES"
   else
@@ -297,20 +307,19 @@ lock_acquire() {
   while ! mkdir "$lock" 2>/dev/null; do
     pid="$(cat "$lock/pid" 2>/dev/null)"
     started="$(cat "$lock/start" 2>/dev/null)"
-    if [ -n "$pid" ] && [ -n "$started" ]; then
-      owner_start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -z "$pid" ] || [ -z "$started" ]; then
+      find "$lock" -maxdepth 0 -mmin -1 | grep -q . && return 1
     else
-      owner_start=
-    fi
-    if [ -n "$pid" ] && [ -n "$owner_start" ] && [ "$owner_start" = "$started" ]; then
-      return 1
+      owner_start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -n "$owner_start" ] && [ "$owner_start" = "$started" ] && return 1
     fi
     stale="$lock.stale.$$"
     [ -e "$stale" ] && stale="$lock.stale.$$.${RANDOM:-0}"
     mv "$lock" "$stale" 2>/dev/null || continue
+    rm -rf "$stale"
   done
   printf '%s\n' "$$" >"$lock/pid"
-  ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' >"$lock/start"
+  LC_ALL=C ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' >"$lock/start"
 }
 
 lock_release() {
@@ -320,7 +329,7 @@ lock_release() {
   lock="$state/locks/$1"
   pid="$(cat "$lock/pid" 2>/dev/null)"
   started="$(cat "$lock/start" 2>/dev/null)"
-  current_start="$(ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  current_start="$(LC_ALL=C ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   [ "$pid" = "$$" ] && [ "$started" = "$current_start" ] || return 1
   rm -f "$lock/pid" "$lock/start" && rmdir "$lock"
 }
@@ -329,14 +338,43 @@ fastup_version_gt() {
   local left="$1" right="$2"
   awk -v a="$left" -v b="$right" 'BEGIN {
     sub(/^[vV]/, "", a); sub(/^[vV]/, "", b)
-    na=split(a, aa, /[.+-]/); nb=split(b, bb, /[.+-]/)
+    split(a, av, /-/); split(b, bv, /-/)
+    split(av[1], aa, /[.]/); split(bv[1], bb, /[.]/)
     for (i=1; i<=3; i++) {
-      x=(i<=na ? aa[i]+0 : 0); y=(i<=nb ? bb[i]+0 : 0)
+      x=aa[i]+0; y=bb[i]+0
       if (x>y) exit 0
       if (x<y) exit 1
     }
+    if (av[2] == "" && bv[2] != "") exit 0
+    if (av[2] != "" && bv[2] == "") exit 1
+    if (av[2] == "" && bv[2] == "") exit 1
+    an=split(av[2], ap, /[.]/); bn=split(bv[2], bp, /[.]/)
+    for (i=1; i<=an && i<=bn; i++) {
+      if (ap[i] ~ /^[0-9]+$/ && bp[i] ~ /^[0-9]+$/) {
+        x=ap[i]+0; y=bp[i]+0
+      } else if (ap[i] ~ /^[0-9]+$/) exit 1
+      else if (bp[i] ~ /^[0-9]+$/) exit 0
+      else { x=ap[i]; y=bp[i] }
+      if (x>y) exit 0
+      if (x<y) exit 1
+    }
+    if (an>bn) exit 0
     exit 1
   }'
+}
+
+fastup_cleanup_update() {
+  [ -z "${FASTUP_CLEANUP_WORK:-}" ] || rm -rf "$FASTUP_CLEANUP_WORK"
+  [ -z "${FASTUP_CLEANUP_LOCK:-}" ] || lock_release "$FASTUP_CLEANUP_LOCK"
+  FASTUP_CLEANUP_WORK=
+  FASTUP_CLEANUP_LOCK=
+}
+
+fastup_update_done() {
+  local rc="$1"
+  fastup_cleanup_update
+  trap - INT TERM EXIT
+  return "$rc"
 }
 
 fastup_update_one() {
@@ -348,47 +386,63 @@ fastup_update_one() {
     return 1
   fi
   lock_acquire "$cli" || { printf '%s: update lock is held\n' "$cli" >&2; return 1; }
-  "$detect_fn" || { rc=$?; lock_release "$cli"; return "$rc"; }
-  current="$("$current_fn")" || { lock_release "$cli"; return 1; }
+  FASTUP_CLEANUP_WORK=
+  FASTUP_CLEANUP_LOCK="$cli"
+  trap 'fastup_cleanup_update; exit 130' INT
+  trap 'fastup_cleanup_update; exit 143' TERM
+  trap 'fastup_cleanup_update' EXIT
+  "$detect_fn" || { rc=$?; fastup_update_done "$rc"; return "$rc"; }
+  current="$("$current_fn" 2>/dev/null)" || {
+    if [ "${FASTUP_FORCE:-0}" = 1 ]; then current=unknown
+    else printf '%s: cannot read current version\n' "$cli" >&2; fastup_update_done 1; return 1; fi
+  }
   LATEST=
   CANDIDATES=
-  "$resolve_fn" || { lock_release "$cli"; return 1; }
+  "$resolve_fn" || { fastup_update_done 1; return 1; }
   if [ -z "${LATEST:-}" ]; then
     printf '%s: official latest version unavailable\n' "$cli" >&2
-    lock_release "$cli"
+    fastup_update_done 1
     return 1
   fi
   if [ "${FASTUP_FORCE:-0}" != 1 ] && { [ "$current" = "$LATEST" ] || fastup_version_gt "$current" "$LATEST"; }; then
     printf '%s: already current (%s)\n' "$cli" "$current"
-    lock_release "$cli"
+    fastup_update_done 0
     return 0
   fi
   if [ "${FASTUP_CHECK:-0}" = 1 ]; then
     printf '%s: update available (%s -> %s)\n' "$cli" "$current" "$LATEST"
-    lock_release "$cli"
+    fastup_update_done 10
     return 10
   fi
   if [ "${FASTUP_DRY_RUN:-0}" = 1 ]; then
     printf '%s: would update %s -> %s\n' "$cli" "$current" "$LATEST"
-    lock_release "$cli"
+    fastup_update_done 0
     return 0
   fi
   # The payload (a copy of the whole download) lives only for this run.
   if ! mkdir -p "${FASTUP_STATE:-$HOME/.cache/fastup}" ||
     ! work="$(mktemp -d "${FASTUP_STATE:-$HOME/.cache/fastup}/payload.XXXXXX")"; then
-    lock_release "$cli"
+    fastup_update_done 1
     return 1
   fi
+  FASTUP_CLEANUP_WORK="$work"
   payload="$(printf '%s\n' "${CANDIDATES:-}" | probe | fetch_verified "$work")" || {
-    rm -rf "$work"
-    lock_release "$cli"
+    fastup_update_done 1
     return 1
   }
   "$install_fn" "$payload"
   rc=$?
-  rm -rf "$work"
-  lock_release "$cli"
+  fastup_update_done "$rc"
   return "$rc"
+}
+
+# Exit-code precedence across CLIs: 1 (failure) > 3 (unsupported) > 10 (update available) > 0.
+fastup_record_rc() {
+  case "$2" in
+    1) max_rc=1 ;;
+    3) [ "$max_rc" -eq 1 ] || max_rc=3 ;;
+    10) [ "$max_rc" -eq 0 ] && max_rc=10 ;;
+  esac
 }
 
 fastup_main() {
@@ -398,6 +452,7 @@ fastup_main() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --help|-h) fastup_usage; return 0 ;;
+      --version) printf 'fastup %s\n' "$FASTUP_VERSION"; return 0 ;;
       --check) check=1 ;;
       --force) force=1 ;;
       --dry-run) dry=1 ;;
@@ -428,13 +483,13 @@ fastup_main() {
         rc=$?
         # Providers return 4 for "not installed": skipped under `all`, an error when named explicitly.
         if [ "$rc" -eq 4 ]; then printf '%s: not installed, skipped\n' "$cli"; rc=0; fi
-        [ "$rc" -le "$max_rc" ] || max_rc=$rc
+        fastup_record_rc "$cli" "$rc"
       done
     else
       fastup_update_one "$name"
       rc=$?
       if [ "$rc" -eq 4 ]; then printf '%s: not installed\n' "$name" >&2; rc=3; fi
-      [ "$rc" -le "$max_rc" ] || max_rc=$rc
+      fastup_record_rc "$name" "$rc"
     fi
   done
   return "$max_rc"
@@ -478,13 +533,18 @@ omp_current() {
   case "$output" in omp/*) printf '%s\n' "${output#omp/}" ;; *) return 1 ;; esac
 }
 
+fastup_resolve_error() {
+  printf '%s: %s\n' "$1" "$2" >&2
+  return 1
+}
+
 omp_resolve() {
   local api metadata tag asset digest url index name
   local api_host
   case "$(uname -m)" in
     arm64) asset=omp-darwin-arm64 ;;
     x86_64) asset=omp-darwin-x64 ;;
-    *) printf 'omp: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+    *) fastup_resolve_error omp "unsupported architecture $(uname -m)"; return 1 ;;
   esac
   api="${FASTUP_OMP_API:-https://api.github.com/repos/can1357/oh-my-pi/releases/latest}"
   api_host="${api#*://}"
@@ -492,28 +552,28 @@ omp_resolve() {
   api_host="${api_host%%:*}"
   # gh may be installed but logged out; fall through to curl then.
   if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1 &&
-    metadata="$(gh api repos/can1357/oh-my-pi/releases/latest 2>/dev/null)"; then
-    :
+    metadata="$(gh api repos/can1357/oh-my-pi/releases/latest 2>/dev/null)"; then :
   elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
-    metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || return 1
+    metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || { fastup_resolve_error omp 'cannot fetch official release metadata'; return 1; }
   else
-    metadata="$(curl -fsSL "$api")" || return 1
+    metadata="$(curl -fsSL "$api")" || { fastup_resolve_error omp 'cannot fetch official release metadata'; return 1; }
   fi
-  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || return 1
+  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || { fastup_resolve_error omp 'official release metadata has no tag'; return 1; }
   index=0
+  digest=; url=
   while :; do
     name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
     if [ "$name" = "$asset" ]; then
-      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || return 1
-      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || return 1
+      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || { fastup_resolve_error omp "asset $asset has no checksum"; return 1; }
+      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || { fastup_resolve_error omp "asset $asset has no download URL"; return 1; }
       break
     fi
     index=$((index + 1))
   done
-  case "${digest:-}" in sha256:*) digest="${digest#sha256:}" ;; *) return 1 ;; esac
-  [ -n "${url:-}" ] || return 1
+  case "${digest:-}" in sha256:*) digest="${digest#sha256:}" ;; *) fastup_resolve_error omp "release ${tag:-unknown} has no checksum for $asset"; return 1 ;; esac
+  [ -n "${url:-}" ] || { fastup_resolve_error omp "release ${tag:-unknown} has no asset $asset"; return 1; }
   LATEST="${tag#v}"
-  CANDIDATES="$(gh_candidates "$url" sha256 "$digest" raw)" || return 1
+  CANDIDATES="$(gh_candidates "$url" sha256 "$digest" raw)" || { fastup_resolve_error omp "cannot build candidates for $asset"; return 1; }
 }
 
 agy_detect() { fastup_native_detect agy; }
@@ -557,14 +617,14 @@ agy_resolve() {
   case "$(uname -m)" in
     arm64) arch=arm64 ;;
     x86_64) arch=amd64 ;;
-    *) printf 'agy: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+    *) fastup_resolve_error agy "unsupported architecture $(uname -m)"; return 1 ;;
   esac
-  metadata="$(curl -fsSL "${FASTUP_AGY_MANIFEST:-https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_$arch.json}")" || return 1
-  version="$(printf '%s' "$metadata" | /usr/bin/plutil -extract version raw -o - - 2>/dev/null)" || return 1
-  url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract url raw -o - - 2>/dev/null)" || return 1
-  digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract sha512 raw -o - - 2>/dev/null)" || return 1
+  metadata="$(curl -fsSL "${FASTUP_AGY_MANIFEST:-https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_$arch.json}")" || { fastup_resolve_error agy 'cannot fetch official release metadata'; return 1; }
+  version="$(printf '%s' "$metadata" | /usr/bin/plutil -extract version raw -o - - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no version'; return 1; }
+  url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract url raw -o - - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no asset URL'; return 1; }
+  digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract sha512 raw -o - - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no SHA-512 checksum'; return 1; }
   LATEST="$version"
-  CANDIDATES="$(agy_candidates_for "$url" "$digest")" || return 1
+  CANDIDATES="$(agy_candidates_for "$url" "$digest")" || { fastup_resolve_error agy 'cannot build download candidates'; return 1; }
 }
 
 fastup_native_install() {
@@ -642,26 +702,26 @@ claude_resolve() {
     [ -n "$channel" ] || channel=latest
   fi
   CLAUDE_BASE="${FASTUP_CLAUDE_BASE:-https://downloads.claude.ai/claude-code-releases}"
-  version="$(curl -fsSL "${CLAUDE_BASE%/}/$channel")" || return 1
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'claude: invalid official version: %s\n' "$version" >&2; return 1; }
+  version="$(curl -fsSL "${CLAUDE_BASE%/}/$channel")" || { fastup_resolve_error claude 'cannot fetch official release version'; return 1; }
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fastup_resolve_error claude "invalid official version: $version"; return 1; }
   case "$(uname -m)" in
     arm64) platform=darwin-arm64 ;;
     x86_64)
       translated="$(sysctl -in sysctl.proc_translated 2>/dev/null)" || translated=0
       if [ "$translated" = 1 ]; then platform=darwin-arm64; else platform=darwin-x64; fi ;;
-    *) printf 'claude: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+    *) fastup_resolve_error claude "unsupported architecture $(uname -m)"; return 1 ;;
   esac
-  manifest="$(curl -fsSL "${CLAUDE_BASE%/}/$version/manifest.json")" || return 1
-  checksum="$(printf '%s' "$manifest" | /usr/bin/plutil -extract "platforms.$platform.checksum" raw -o - - 2>/dev/null)" || return 1
+  manifest="$(curl -fsSL "${CLAUDE_BASE%/}/$version/manifest.json")" || { fastup_resolve_error claude "cannot fetch official manifest for $version"; return 1; }
+  checksum="$(printf '%s' "$manifest" | /usr/bin/plutil -extract "platforms.$platform.checksum" raw -o - - 2>/dev/null)" || { fastup_resolve_error claude "manifest has no checksum for $platform"; return 1; }
   case "$checksum" in
     ????????????????????????????????????????????????????????????????) ;;
-    *) printf 'claude: invalid official SHA-256 checksum\n' >&2; return 1 ;;
+    *) fastup_resolve_error claude 'invalid official SHA-256 checksum'; return 1 ;;
   esac
-  case "$checksum" in *[!0-9a-f]*) printf 'claude: invalid official SHA-256 checksum\n' >&2; return 1 ;; esac
+  case "$checksum" in *[!0-9a-f]*) fastup_resolve_error claude 'invalid official SHA-256 checksum'; return 1 ;; esac
   LATEST="$version"
   CLAUDE_CHECKSUM="$checksum"
   CANDIDATES="$(printf '%s\tsha256\t%s\traw\n' "${CLAUDE_BASE%/}/$version/$platform/claude" "$checksum"
-    npm_candidates "@anthropic-ai/claude-code-$platform" "$version" tgz:package/claude)" || return 1
+    npm_candidates "@anthropic-ai/claude-code-$platform" "$version" tgz:package/claude)" || { fastup_resolve_error claude 'cannot build official release candidates'; return 1; }
 }
 
 claude_install() {
@@ -708,7 +768,7 @@ codex_resolve() {
   case "$(uname -m)" in
     arm64) npm_arch=arm64; target=aarch64-apple-darwin ;;
     x86_64) npm_arch=x64; target=x86_64-apple-darwin ;;
-    *) printf 'codex: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+    *) fastup_resolve_error codex "unsupported architecture $(uname -m)"; return 1 ;;
   esac
   asset="codex-package-$target.tar.gz"
   api="${FASTUP_CODEX_RELEASES:-https://releases.openai.com/codex}"
@@ -721,35 +781,36 @@ codex_resolve() {
       metadata="$(gh api repos/openai/codex/releases/latest 2>/dev/null)"; then
       :
     elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
-      metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || return 1
+      metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || { fastup_resolve_error codex 'cannot fetch official release metadata'; return 1; }
     else
-      metadata="$(curl -fsSL "$api")" || return 1
+      metadata="$(curl -fsSL "$api")" || { fastup_resolve_error codex 'cannot fetch official release metadata'; return 1; }
     fi
   fi
-  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || return 1
-  case "$tag" in rust-v*) version="${tag#rust-v}" ;; *) printf 'codex: invalid official release tag: %s\n' "$tag" >&2; return 1 ;; esac
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?$ ]] || return 1
+  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || { fastup_resolve_error codex 'official release metadata has no tag'; return 1; }
+  case "$tag" in rust-v*) version="${tag#rust-v}" ;; *) fastup_resolve_error codex "invalid official release tag: $tag"; return 1 ;; esac
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?$ ]] || { fastup_resolve_error codex "invalid official release version: $version"; return 1; }
   index=0; url=; digest=
   while :; do
     name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
     if [ "$name" = "$asset" ]; then
-      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || return 1
-      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || return 1
+      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || { fastup_resolve_error codex "asset $asset has no checksum"; return 1; }
+      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || { fastup_resolve_error codex "asset $asset has no download URL"; return 1; }
       break
     fi
     index=$((index + 1))
   done
-  case "$digest" in sha256:*) digest="${digest#sha256:}" ;; *) return 1 ;; esac
+  case "$digest" in sha256:*) digest="${digest#sha256:}" ;; *) fastup_resolve_error codex "release $tag has no checksum for $asset"; return 1 ;; esac
   case "$digest" in
     ????????????????????????????????????????????????????????????????) ;;
-    *) return 1 ;;
+    *) fastup_resolve_error codex "invalid checksum for $asset"; return 1 ;;
   esac
-  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
-  [ -n "$url" ] || return 1
+  case "$digest" in *[!0-9a-f]*) fastup_resolve_error codex "invalid checksum for $asset"; return 1 ;; esac
+  [ -n "$url" ] || { fastup_resolve_error codex "release $tag has no asset $asset"; return 1; }
   LATEST="$version"
   CANDIDATES="$(printf '%s\tsha256\t%s\ttgz:.\n' "$url" "$digest"
-    gh_candidates "${FASTUP_CODEX_GITHUB:-https://github.com/openai/codex/releases/download}/rust-v$version/$asset" sha256 "$digest" tgz:.
-    npm_candidates @openai/codex "$version-darwin-$npm_arch" "tgz:package/vendor/$target")" || return 1
+    gh_candidates "${FASTUP_CODEX_GITHUB:-https://github.com/openai/codex/releases/download}/rust-v$version/$asset" sha256 "$digest" tgz:. |
+      awk -F '\t' -v direct="$url" '$1 != direct'
+    npm_candidates @openai/codex "$version-darwin-$npm_arch" "tgz:package/vendor/$target")" || { fastup_resolve_error codex 'cannot build official release candidates'; return 1; }
 }
 
 
@@ -778,11 +839,11 @@ codex_current() {
   printf '%s\n' "$output" | awk 'END { print $NF }'
 }
 
-codex_install() {
-  local payload="$1" releases release stage path update_rc current_real release_real new
+codex_install_locked() {
+  local payload="$1" releases release stage path
   releases="$CODEX_ROOT/releases"
   release="$releases/$LATEST-$CODEX_TARGET"
-  stage="$releases/.staging.$LATEST-$CODEX_TARGET.$$"
+  stage="$releases/.fastup-stage.$LATEST-$CODEX_TARGET.$$"
   mkdir -p "$releases" || return 1
   mkdir "$stage" || return 1
   if ! cp -R "$payload"/. "$stage"/; then rm -rf "$stage"; return 1; fi
@@ -799,13 +860,29 @@ codex_install() {
     return 1
   fi
   rm -rf "$release.old.$$"
+}
+
+codex_install() {
+  local payload="$1" lock_rc update_rc current_real release_real new script release
+  release="$CODEX_ROOT/releases/$LATEST-$CODEX_TARGET"
+  # Hold the official installer's lock while staging, so a concurrent `codex update` cannot clean up or
+  # switch to a half-copied release; release it before running that same installer below.
+  if [ -x /usr/bin/lockf ]; then
+    script="${BASH_SOURCE[0]}"
+    /usr/bin/lockf -k "$CODEX_ROOT/install.lock" bash -c "source \"\$1\"; CODEX_ROOT=\"\$2\"; LATEST=\"\$3\"; CODEX_TARGET=\"\$4\"; codex_install_locked \"\$5\"" _ "$script" "$CODEX_ROOT" "$LATEST" "$CODEX_TARGET" "$payload"
+    lock_rc=$?
+  else
+    codex_install_locked "$payload"
+    lock_rc=$?
+  fi
+  [ "$lock_rc" -eq 0 ] || return 1
   unset CODEX_RELEASE
   if [ -n "${FASTUP_CODEX_UPDATE_CMD:-}" ]; then
-    CODEX_HOME="$CODEX_HOME_DIR" sh -c "$FASTUP_CODEX_UPDATE_CMD"; update_rc=$?
+    CODEX_NON_INTERACTIVE=1 CODEX_HOME="$CODEX_HOME_DIR" sh -c "$FASTUP_CODEX_UPDATE_CMD"; update_rc=$?
   elif [ -x "$CODEX_ROOT/current/bin/codex" ]; then
-    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_ROOT/current/bin/codex" update; update_rc=$?
+    CODEX_NON_INTERACTIVE=1 CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_ROOT/current/bin/codex" update; update_rc=$?
   elif [ -x "$CODEX_ROOT/current/codex" ]; then
-    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_ROOT/current/codex" update; update_rc=$?
+    CODEX_NON_INTERACTIVE=1 CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_ROOT/current/codex" update; update_rc=$?
   else
     update_rc=1
   fi
@@ -818,7 +895,6 @@ codex_install() {
   fi
   printf 'codex: updated %s -> %s\n' "${current:-unknown}" "$new"
 }
-
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fastup_main "$@"
   exit $?
