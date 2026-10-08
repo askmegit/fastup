@@ -595,6 +595,218 @@ fastup_native_install() {
 
 omp_install() { fastup_native_install omp "${OMP_TARGET:-}" "$1"; }
 agy_install() { fastup_native_install agy "${AGY_TARGET:-}" "$1"; }
+fastup_resolve_path() {
+  local path="$1" target directory count=0
+  while [ -L "$path" ]; do
+    count=$((count + 1))
+    [ "$count" -le 40 ] || return 1
+    directory="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+    target="$(readlink "$path")" || return 1
+    case "$target" in /*) path="$target" ;; *) path="$directory/$target" ;; esac
+  done
+  directory="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$directory" "${path##*/}"
+}
+
+claude_detect() {
+  local target versions_dir
+  CLAUDE_HOME_DIR="${FASTUP_CLAUDE_HOME:-$HOME/.local}"
+  CLAUDE_LINK="$CLAUDE_HOME_DIR/bin/claude"
+  CLAUDE_VERSIONS_DIR="$CLAUDE_HOME_DIR/share/claude/versions"
+  [ -L "$CLAUDE_LINK" ] || { fastup_native_unsupported claude "not a native install at $CLAUDE_LINK"; return 3; }
+  [ -d "$CLAUDE_VERSIONS_DIR" ] || { fastup_native_unsupported claude "$CLAUDE_VERSIONS_DIR is missing"; return 3; }
+  target="$(readlink "$CLAUDE_LINK")" || { fastup_native_unsupported claude "cannot read $CLAUDE_LINK"; return 3; }
+  case "$target" in /*) ;; *) target="$(cd "$(dirname "$CLAUDE_LINK")" && pwd -P)/$target" ;; esac
+  target="$(fastup_resolve_path "$target")" || { fastup_native_unsupported claude "cannot resolve $CLAUDE_LINK target"; return 3; }
+  versions_dir="$(cd "$CLAUDE_VERSIONS_DIR" && pwd -P)" || { fastup_native_unsupported claude "$CLAUDE_VERSIONS_DIR is unavailable"; return 3; }
+  case "$target" in "$versions_dir"/*) ;; *) fastup_native_unsupported claude "$CLAUDE_LINK does not resolve into $versions_dir"; return 3 ;; esac
+  [ -x "$CLAUDE_LINK" ] || { fastup_native_unsupported claude "$CLAUDE_LINK is not executable"; return 3; }
+}
+
+claude_current() {
+  local output
+  output="${CLAUDE_LINK:-}"; [ -n "$output" ] || return 1
+  output="$("$output" --version 2>/dev/null)" || return 1
+  printf '%s\n' "$output" | awk 'NR == 1 { print $1 }'
+}
+
+claude_resolve() {
+  local channel metadata version manifest platform checksum translated
+  channel=latest
+  if [ -f "$HOME/.claude/settings.json" ]; then
+    channel="$(/usr/bin/plutil -extract autoUpdatesChannel raw -o - "$HOME/.claude/settings.json" 2>/dev/null)" || channel=latest
+    [ -n "$channel" ] || channel=latest
+  fi
+  CLAUDE_BASE="${FASTUP_CLAUDE_BASE:-https://downloads.claude.ai/claude-code-releases}"
+  version="$(curl -fsSL "${CLAUDE_BASE%/}/$channel")" || return 1
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'claude: invalid official version: %s\n' "$version" >&2; return 1; }
+  case "$(uname -m)" in
+    arm64) platform=darwin-arm64 ;;
+    x86_64)
+      translated="$(sysctl -in sysctl.proc_translated 2>/dev/null)" || translated=0
+      if [ "$translated" = 1 ]; then platform=darwin-arm64; else platform=darwin-x64; fi ;;
+    *) printf 'claude: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+  esac
+  manifest="$(curl -fsSL "${CLAUDE_BASE%/}/$version/manifest.json")" || return 1
+  checksum="$(printf '%s' "$manifest" | /usr/bin/plutil -extract "platforms.$platform.checksum" raw -o - - 2>/dev/null)" || return 1
+  case "$checksum" in
+    ????????????????????????????????????????????????????????????????) ;;
+    *) printf 'claude: invalid official SHA-256 checksum\n' >&2; return 1 ;;
+  esac
+  case "$checksum" in *[!0-9a-f]*) printf 'claude: invalid official SHA-256 checksum\n' >&2; return 1 ;; esac
+  LATEST="$version"
+  CLAUDE_CHECKSUM="$checksum"
+  CANDIDATES="$(printf '%s\tsha256\t%s\traw\n' "${CLAUDE_BASE%/}/$version/$platform/claude" "$checksum"
+    npm_candidates "@anthropic-ai/claude-code-$platform" "$version" tgz:package/claude)" || return 1
+}
+
+claude_install() {
+  local payload="$1" actual reported new old_target version_file tmp backup tmp_link
+  actual="$(fastup_hash_file "$payload" sha256)" || return 1
+  [ "$actual" = "${CLAUDE_CHECKSUM:-}" ] || { printf 'claude: payload SHA-256 does not match official manifest\n' >&2; return 1; }
+  if [ "$(uname -s)" = Darwin ]; then
+    codesign --verify --strict "$payload" || return 1
+  fi
+  chmod 755 "$payload" || return 1
+  reported="$("$payload" --version 2>/dev/null)" || reported=
+  new="$(printf '%s\n' "$reported" | awk 'NR == 1 { print $1 }')"
+  [ "$new" = "$LATEST" ] || { printf 'claude: downloaded version %s does not match %s\n' "$new" "$LATEST" >&2; return 1; }
+  old_target="$(readlink "$CLAUDE_LINK")" || return 1
+  version_file="$CLAUDE_VERSIONS_DIR/$LATEST"
+  tmp="$CLAUDE_VERSIONS_DIR/.$LATEST.tmp.$$"
+  backup="$CLAUDE_VERSIONS_DIR/.$LATEST.backup.$$"
+  if ! cp "$payload" "$tmp" || ! chmod 755 "$tmp"; then rm -f "$tmp"; return 1; fi
+  if [ -e "$version_file" ]; then
+    if [ -L "$version_file" ] || ! ln "$version_file" "$backup"; then rm -f "$tmp"; return 1; fi
+  fi
+  if ! mv -f "$tmp" "$version_file"; then rm -f "$tmp" "$backup"; return 1; fi
+  tmp_link="$(dirname "$CLAUDE_LINK")/.claude.new.$$"
+  if ! ln -s "$version_file" "$tmp_link" || ! mv -f "$tmp_link" "$CLAUDE_LINK"; then
+    rm -f "$tmp_link" "$version_file"
+    [ ! -e "$backup" ] || mv -f "$backup" "$version_file"
+    return 1
+  fi
+  reported="$(claude_current 2>/dev/null)" || reported=
+  if [ "$reported" != "$LATEST" ]; then
+    tmp_link="$(dirname "$CLAUDE_LINK")/.claude.rollback.$$"
+    ln -s "$old_target" "$tmp_link" && mv -f "$tmp_link" "$CLAUDE_LINK"
+    if [ -e "$backup" ]; then mv -f "$backup" "$version_file"; else rm -f "$version_file"; fi
+    printf 'claude: installed version %s does not match %s; restored previous target\n' "$reported" "$LATEST" >&2
+    return 1
+  fi
+  rm -f "$backup"
+  printf 'claude: updated %s -> %s\n' "${current:-unknown}" "$reported"
+}
+
+
+codex_resolve() {
+  local npm_arch target asset metadata api api_host tag version digest url index name
+  case "$(uname -m)" in
+    arm64) npm_arch=arm64; target=aarch64-apple-darwin ;;
+    x86_64) npm_arch=x64; target=x86_64-apple-darwin ;;
+    *) printf 'codex: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+  esac
+  asset="codex-package-$target.tar.gz"
+  api="${FASTUP_CODEX_RELEASES:-https://releases.openai.com/codex}"
+  if metadata="$(curl -fsSL "${api%/}/channels/latest" 2>/dev/null)"; then
+    :
+  else
+    api=https://api.github.com/repos/openai/codex/releases/latest
+    api_host="${api#*://}"; api_host="${api_host%%/*}"; api_host="${api_host%%:*}"
+    if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1 &&
+      metadata="$(gh api repos/openai/codex/releases/latest 2>/dev/null)"; then
+      :
+    elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+      metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || return 1
+    else
+      metadata="$(curl -fsSL "$api")" || return 1
+    fi
+  fi
+  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || return 1
+  case "$tag" in rust-v*) version="${tag#rust-v}" ;; *) printf 'codex: invalid official release tag: %s\n' "$tag" >&2; return 1 ;; esac
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?$ ]] || return 1
+  index=0; url=; digest=
+  while :; do
+    name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
+    if [ "$name" = "$asset" ]; then
+      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || return 1
+      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || return 1
+      break
+    fi
+    index=$((index + 1))
+  done
+  case "$digest" in sha256:*) digest="${digest#sha256:}" ;; *) return 1 ;; esac
+  case "$digest" in
+    ????????????????????????????????????????????????????????????????) ;;
+    *) return 1 ;;
+  esac
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  [ -n "$url" ] || return 1
+  LATEST="$version"
+  CANDIDATES="$(printf '%s\tsha256\t%s\ttgz:.\n' "$url" "$digest"
+    gh_candidates "${FASTUP_CODEX_GITHUB:-https://github.com/openai/codex/releases/download}/rust-v$version/$asset" sha256 "$digest" tgz:.
+    npm_candidates @openai/codex "$version-darwin-$npm_arch" "tgz:package/vendor/$target")" || return 1
+}
+
+
+codex_detect() {
+  local current releases resolved
+  CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+  CODEX_ROOT="$CODEX_HOME_DIR/packages/standalone"
+  current="$CODEX_ROOT/current"
+  releases="$CODEX_ROOT/releases"
+  [ -L "$current" ] || { fastup_native_unsupported codex "$current is not a standalone release symlink"; return 3; }
+  [ -d "$releases" ] || { fastup_native_unsupported codex "$releases is missing"; return 3; }
+  resolved="$(cd "$current" 2>/dev/null && pwd -P)" || { fastup_native_unsupported codex "$current cannot be resolved"; return 3; }
+  releases="$(cd "$releases" 2>/dev/null && pwd -P)" || { fastup_native_unsupported codex "$releases is unavailable"; return 3; }
+  case "$resolved" in "$releases"/*) ;; *) fastup_native_unsupported codex "$current does not resolve into $releases"; return 3 ;; esac
+  case "$(uname -m)" in arm64) CODEX_TARGET=aarch64-apple-darwin ;; x86_64) CODEX_TARGET=x86_64-apple-darwin ;; *) fastup_native_unsupported codex "unsupported architecture $(uname -m)"; return 3 ;; esac
+  if [ -x "$current/bin/codex" ]; then CODEX_CURRENT_BIN="$current/bin/codex"
+  elif [ -x "$current/codex" ]; then CODEX_CURRENT_BIN="$current/codex"
+  else fastup_native_unsupported codex "$current has no executable codex binary"; return 3
+  fi
+}
+
+codex_current() {
+  local output
+  output="$("${CODEX_CURRENT_BIN:-}" --version 2>/dev/null)" || return 1
+  printf '%s\n' "$output" | awk 'END { print $NF }'
+}
+
+codex_install() {
+  local payload="$1" releases release stage path update_rc current_real release_real new
+  releases="$CODEX_ROOT/releases"
+  release="$releases/$LATEST-$CODEX_TARGET"
+  stage="$releases/.staging.$LATEST-$CODEX_TARGET.$$"
+  mkdir -p "$releases" || return 1
+  mkdir "$stage" || return 1
+  if ! cp -R "$payload"/. "$stage"/; then rm -rf "$stage"; return 1; fi
+  [ -f "$stage/bin/codex" ] || { rm -rf "$stage"; return 1; }
+  for path in bin/codex bin/codex-code-mode-host codex-path/rg; do
+    [ ! -e "$stage/$path" ] || chmod 755 "$stage/$path" || { rm -rf "$stage"; return 1; }
+  done
+  ln -sf bin/codex "$stage/codex" || { rm -rf "$stage"; return 1; }
+  rm -rf "$release"
+  if ! mv "$stage" "$release"; then rm -rf "$stage"; return 1; fi
+  unset CODEX_RELEASE
+  if [ -n "${FASTUP_CODEX_UPDATE_CMD:-}" ]; then
+    CODEX_HOME="$CODEX_HOME_DIR" sh -c "$FASTUP_CODEX_UPDATE_CMD"; update_rc=$?
+  elif [ -x "$CODEX_ROOT/current/bin/codex" ]; then
+    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_ROOT/current/bin/codex" update; update_rc=$?
+  elif [ -x "$CODEX_ROOT/current/codex" ]; then
+    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_ROOT/current/codex" update; update_rc=$?
+  else
+    update_rc=1
+  fi
+  current_real="$(cd "$CODEX_ROOT/current" 2>/dev/null && pwd -P)" || current_real=
+  release_real="$(cd "$release" 2>/dev/null && pwd -P)" || release_real=
+  new="$("$CODEX_ROOT/current/bin/codex" --version 2>/dev/null | awk 'END { print $NF }')" || new=
+  if [ "$update_rc" -ne 0 ] || [ "$current_real" != "$release_real" ] || [ "$new" != "$LATEST" ]; then
+    printf 'codex: official codex update did not switch to %s\n' "$LATEST" >&2
+    return 1
+  fi
+  printf 'codex: updated %s -> %s\n' "${current:-unknown}" "$new"
+}
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fastup_main "$@"
