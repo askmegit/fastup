@@ -37,8 +37,8 @@ EOF
   [ -f "$body" ] && count="$(wc -c <"$body" | tr -d ' ')"
   file_size="$(tr '[:upper:]' '[:lower:]' <"$headers" 2>/dev/null | awk '
     /^content-range:/ { split($3, p, "/"); if (p[2] ~ /^[0-9]+$/) total=p[2] }
-    /^content-length:/ { length=$2; gsub("\\r", "", length) }
-    END { if (total != "") print total; else if (length != "") print length; else print 0 }
+    /^content-length:/ { clen=$2; gsub("\\r", "", clen) }
+    END { if (total != "") print total; else if (clen != "") print clen; else print 0 }
   ')"
   [ -n "$file_size" ] || file_size=0
   [ "$file_size" -gt 0 ] 2>/dev/null || file_size="$bytes"

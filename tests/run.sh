@@ -116,6 +116,11 @@ t_probe_respects_timeout_without_range() {
     bad probe_respects_timeout_without_range "took ${el}s with timeout ${FASTUP_PROBE_TIMEOUT}s"
 }
 
+t_probe_stderr_quiet() {
+  printf '%s\n' "$(line "$BASE/good.bin" sha256 "$GOOD256" raw)" | lib 'probe' >/dev/null 2>"$WORK/err"
+  [ ! -s "$WORK/err" ] && ok probe_stderr_quiet || bad probe_stderr_quiet "probe wrote to stderr: $(head -3 "$WORK/err")"
+}
+
 t_probe_keeps_all_candidates() {
   input="$(line "$BASE/a" sha256 x raw)
 $(line "$BASE/b" sha256 x raw)"
