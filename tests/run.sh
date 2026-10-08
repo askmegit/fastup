@@ -314,6 +314,8 @@ t_shellcheck_disable_budget() {
 . "$HERE/providers_claude_codex.sh"
 # shellcheck source=tests/review_fixes.sh
 . "$HERE/review_fixes.sh"
+# shellcheck source=tests/self_update.sh
+. "$HERE/self_update.sh"
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do run "$t"; done
 
