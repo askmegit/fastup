@@ -16,7 +16,9 @@ mkdir -p "$ROOT"
 python3 "$HERE/fixture_server.py" "$ROOT" "$WORK/port" "$LOG" &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$WORK"' EXIT
-for _ in $(seq 50); do [ -s "$WORK/port" ] && break; sleep 0.1; done
+# A cold CI runner can take several seconds to start python3.
+for _ in $(seq 300); do [ -s "$WORK/port" ] && break; sleep 0.1; done
+[ -s "$WORK/port" ] || { echo "fixture server did not start within 30s" >&2; exit 1; }
 PORT="$(cat "$WORK/port")"
 BASE="http://127.0.0.1:$PORT"
 
