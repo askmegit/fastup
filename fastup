@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+
+fastup_usage() {
+  cat <<'USAGE'
+Usage: fastup [options] <claude|codex|omp|agy|all>...
+
+Options:
+  --check          Report available updates without installing (exit 10 if available)
+  --force          Allow reinstalling or downgrading
+  --via PREFIX     Use PREFIX for accelerated download candidates
+  --dry-run        Show planned updates without installing
+  -v               Print probe speeds
+  -h, --help       Show this help
+USAGE
+}
+
+fastup_probe_one() {
+  local candidate="$1" bytes="$2" timeout="$3" dir="$4" index="$5"
+  local url algo digest format meta rc status content_type total_time start_time
+  local headers body count file_size speed lower_type
+  IFS=$'\t' read -r url algo digest format <<EOF
+$candidate
+EOF
+  headers="$dir/headers.$index"
+  body="$dir/body.$index"
+  meta="$(curl -L -r "0-$((bytes - 1))" --max-time "$timeout" -sS \
+    -D "$headers" -o >(head -c "$bytes" >"$body") \
+    -w '%{http_code}\t%{content_type}\t%{time_total}\t%{time_starttransfer}' \
+    "$url" 2>/dev/null)"
+  rc=$?
+  IFS=$'\t' read -r status content_type total_time start_time <<EOF
+$meta
+EOF
+  count=0
+  [ -f "$body" ] && count="$(wc -c <"$body" | tr -d ' ')"
+  file_size="$(tr '[:upper:]' '[:lower:]' <"$headers" 2>/dev/null | awk '
+    /^content-range:/ { split($3, p, "/"); if (p[2] ~ /^[0-9]+$/) total=p[2] }
+    /^content-length:/ { length=$2; gsub("\\r", "", length) }
+    END { if (total != "") print total; else if (length != "") print length; else print 0 }
+  ')"
+  [ -n "$file_size" ] || file_size=0
+  [ "$file_size" -gt 0 ] 2>/dev/null || file_size="$bytes"
+  lower_type="$(printf '%s' "$content_type" | tr '[:upper:]' '[:lower:]')"
+  speed=0
+  if { [ "$rc" -eq 0 ] || { { [ "$rc" -eq 23 ] || [ "$rc" -eq 28 ]; } && [ "$count" -gt 0 ]; }; } &&
+      { [ "$status" = 200 ] || [ "$status" = 206 ]; } &&
+      { [ "$count" -ge "$bytes" ] || [ "$count" -ge "$file_size" ]; } &&
+      [ "${lower_type#text/html}" = "$lower_type" ]; then
+    speed="$(awk -v n="$count" -v total="$total_time" -v start="$start_time" \
+      'BEGIN { elapsed=total-start; if (elapsed <= 0) elapsed=0.001; printf "%.0f", n/elapsed }')"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$speed" "$index" "$url" "$algo" "$digest" "$format" "$speed" >"$dir/result.$index"
+  if [ "${FASTUP_VERBOSE:-0}" = 1 ]; then
+    printf 'fastup: %s %s B/s\n' "$url" "$speed" >&2
+  fi
+}
+
+probe() {
+  if [ -n "${FASTUP_VIA:-}" ]; then
+    cat
+    return 0
+  fi
+  local bytes timeout parallel state dir line count index batch pid tab
+  local -a candidates pids
+  bytes="${FASTUP_PROBE_BYTES:-2097152}"
+  timeout="${FASTUP_PROBE_TIMEOUT:-6}"
+  parallel="${FASTUP_PROBE_PARALLEL:-3}"
+  case "$bytes" in ''|*[!0-9]*|0) bytes=2097152 ;; esac
+  case "$timeout" in ''|*[!0-9]*|0) timeout=6 ;; esac
+  case "$parallel" in ''|*[!0-9]*|0) parallel=3 ;; esac
+  state="${FASTUP_STATE:-$HOME/.cache/fastup}"
+  mkdir -p "$state" || return 1
+  dir="$(mktemp -d "$state/probe.XXXXXX")" || return 1
+  count=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    candidates[count]="$line"
+    count=$((count + 1))
+  done
+  index=0
+  while [ "$index" -lt "$count" ]; do
+    batch=0
+    pids=()
+    while [ "$batch" -lt "$parallel" ] && [ "$index" -lt "$count" ]; do
+      fastup_probe_one "${candidates[$index]}" "$bytes" "$timeout" "$dir" "$index" &
+      pids[batch]=$!
+      index=$((index + 1))
+      batch=$((batch + 1))
+    done
+    batch=0
+    while [ "$batch" -lt "${#pids[@]}" ]; do
+      wait "${pids[$batch]}" || :
+      batch=$((batch + 1))
+    done
+  done
+  tab="$(printf '\t')"
+  if [ "$count" -gt 0 ]; then
+    sort -t "$tab" -k1,1nr -k2,2n "$dir"/result.* | cut -f3-
+  fi
+  rm -f "$dir"/headers.* "$dir"/body.* "$dir"/result.*
+  rmdir "$dir"
+}
+
+fastup_hash_file() {
+  case "$2" in
+    sha256) shasum -a 256 "$1" | awk '{print $1}' ;;
+    sha512) shasum -a 512 "$1" | awk '{print $1}' ;;
+    *) return 1 ;;
+  esac
+}
+
+fastup_safe_inner_path() {
+  case "$1" in
+    ''|/*|*..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+fastup_archive_paths_safe() {
+  local archive="$1" members member
+  members="$(tar -tzf "$archive")" || return 1
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    case "$member" in /*|..|../*|*/../*|*/..) return 1 ;; esac
+  done <<EOF
+$members
+EOF
+}
+
+fastup_symlinks_safe() {
+  local root="$1" link target rel parent depth component old_ifs
+  while IFS= read -r link; do
+    target="$(readlink "$link")" || return 1
+    case "$target" in /*) return 1 ;; esac
+    rel="${link#"$root"/}"
+    parent="${rel%/*}"
+    depth=0
+    old_ifs="$IFS"
+    IFS=/
+    for component in $parent; do
+      case "$component" in ''|.) ;; ..) depth=$((depth - 1)) ;; *) depth=$((depth + 1)) ;; esac
+    done
+    for component in $target; do
+      case "$component" in ''|.) ;; ..) depth=$((depth - 1)) ;; *) depth=$((depth + 1)) ;; esac
+      [ "$depth" -ge 0 ] || { IFS="$old_ifs"; return 1; }
+    done
+    IFS="$old_ifs"
+  done < <(find "$root" -type l -print)
+  return 0
+}
+
+fetch_verified() {
+  [ "$#" -eq 1 ] || return 2
+  local outdir state partial_dir line url algo digest format speed actual stall rc inner payload extract_dir
+  local out_abs candidate_seen
+  outdir="$1"
+  mkdir -p "$outdir" || return 1
+  out_abs="$(cd "$outdir" && pwd -P)" || return 1
+  state="${FASTUP_STATE:-$HOME/.cache/fastup}"
+  partial_dir="$state/partial"
+  mkdir -p "$partial_dir" || return 1
+  candidate_seen=0
+  while IFS=$'\t' read -r url algo digest format speed || [ -n "$url$algo$digest$format$speed" ]; do
+    [ -n "$url" ] || continue
+    candidate_seen=1
+    case "$algo" in sha256|sha512) ;; *) printf 'fastup: unsupported checksum algorithm\n' >&2; return 1 ;; esac
+    case "$algo:$digest" in
+      sha256:????????????????????????????????????????????????????????????????|sha512:????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????) ;;
+      *) printf 'fastup: invalid checksum digest\n' >&2; return 1 ;;
+    esac
+    case "$digest" in *[!0-9a-f]*) printf 'fastup: invalid checksum digest\n' >&2; return 1 ;; esac
+    case "$format" in
+      raw) inner= ;;
+      tgz:*) inner="${format#tgz:}"; fastup_safe_inner_path "$inner" || { printf 'fastup: unsafe archive payload path\n' >&2; return 1; } ;;
+      *) printf 'fastup: unsupported candidate format\n' >&2; return 1 ;;
+    esac
+    partial="$partial_dir/$digest"
+    case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
+    stall="${FASTUP_STALL_TIME:-30}"
+    case "$stall" in ''|*[!0-9]*|0) stall=30 ;; esac
+    stall=$((speed / 4))
+    [ "$stall" -ge 1024 ] || stall=1024
+    if curl -fL -C - --retry 2 --speed-limit "$stall" --speed-time "${FASTUP_STALL_TIME:-30}" \
+      -o "$partial" "$url"; then
+      actual="$(fastup_hash_file "$partial" "$algo")" || actual=
+      if [ "$actual" != "$digest" ]; then
+        printf 'fastup: checksum mismatch for %s\n' "$url" >&2
+        rm -f "$partial"
+        continue
+      fi
+      if [ "$format" = raw ]; then
+        payload="$(mktemp "$out_abs/.fastup.XXXXXX")" || return 1
+        if ! cp "$partial" "$payload" || ! chmod 755 "$payload"; then
+          rm -f "$payload"
+          return 1
+        fi
+        rm -f "$partial"
+        printf '%s\n' "$payload"
+        return 0
+      fi
+      if ! fastup_archive_paths_safe "$partial"; then
+        printf 'fastup: unsafe archive member path\n' >&2
+        continue
+      fi
+      extract_dir="$(mktemp -d "$out_abs/.fastup.XXXXXX")" || return 1
+      if ! tar -xzf "$partial" -C "$extract_dir" || ! fastup_symlinks_safe "$extract_dir"; then
+        printf 'fastup: unsafe or invalid archive\n' >&2
+        rm -rf "$extract_dir"
+        continue
+      fi
+      payload="$extract_dir/$inner"
+      if [ ! -e "$payload" ] && [ ! -L "$payload" ]; then
+        printf 'fastup: archive payload not found\n' >&2
+        rm -rf "$extract_dir"
+        continue
+      fi
+      printf '%s\n' "$payload"
+      return 0
+    else
+      rc=$?
+      [ "$rc" -eq 0 ] || :
+    fi
+  done
+  if [ "$candidate_seen" -eq 0 ]; then
+    printf 'fastup: no download candidates\n' >&2
+  fi
+  return 1
+}
+
+gh_candidates() {
+  [ "$#" -eq 4 ] || return 2
+  local url="$1" algo="$2" digest="$3" format="$4" prefixes prefix
+  printf '%s\t%s\t%s\t%s\n' "$url" "$algo" "$digest" "$format"
+  if [ -n "${FASTUP_VIA:-}" ]; then
+    printf '%s\t%s\t%s\t%s\n' "${FASTUP_VIA}${url}" "$algo" "$digest" "$format"
+    return 0
+  fi
+  if [ "${FASTUP_GH_PROXIES+x}" = x ]; then
+    prefixes="$FASTUP_GH_PROXIES"
+  else
+    prefixes='https://gh-proxy.com/ https://ghfast.top/ https://gh.llkk.cc/ https://ghproxy.net/'
+  fi
+  local -a proxy_list
+  IFS=' ' read -r -a proxy_list <<EOF
+$prefixes
+EOF
+  index=0
+  while [ "$index" -lt "${#proxy_list[@]}" ]; do
+    prefix="${proxy_list[$index]}"
+    [ -n "$prefix" ] && printf '%s\t%s\t%s\t%s\n' "${prefix}${url}" "$algo" "$digest" "$format"
+    index=$((index + 1))
+  done
+}
+
+npm_candidates() {
+  [ "$#" -eq 3 ] || return 2
+  local pkg="$1" version="$2" format="$3" registry metadata tarball integrity encoded digest path mirrors mirror
+  registry="${FASTUP_NPM_REGISTRY:-https://registry.npmjs.org}"
+  registry="${registry%/}"
+  metadata="$(curl -fsSL "$registry/$pkg/$version" 2>/dev/null)" || return 0
+  tarball="$(printf '%s' "$metadata" | /usr/bin/plutil -extract dist.tarball raw -o - - 2>/dev/null)" || return 0
+  integrity="$(printf '%s' "$metadata" | /usr/bin/plutil -extract dist.integrity raw -o - - 2>/dev/null)" || return 0
+  case "$integrity" in sha512-*) encoded="${integrity#sha512-}" ;; *) return 0 ;; esac
+  digest="$(printf '%s' "$encoded" | openssl base64 -d -A 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [ "${#digest}" -eq 128 ] || return 0
+  case "$tarball" in "$registry"/*) path="${tarball#"$registry"}" ;; *) return 0 ;; esac
+  printf '%s\tsha512\t%s\t%s\n' "$tarball" "$digest" "$format"
+  if [ "${FASTUP_NPM_MIRRORS+x}" = x ]; then
+    mirrors="$FASTUP_NPM_MIRRORS"
+  else
+    mirrors='https://registry.npmmirror.com'
+  fi
+  local -a mirror_list
+  IFS=' ' read -r -a mirror_list <<EOF
+$mirrors
+EOF
+  index=0
+  while [ "$index" -lt "${#mirror_list[@]}" ]; do
+    mirror="${mirror_list[$index]}"
+    mirror="${mirror%/}"
+    [ -n "$mirror" ] && printf '%s\tsha512\t%s\t%s\n' "${mirror}${path}" "$digest" "$format"
+    index=$((index + 1))
+  done
+  return 0
+}
+
+lock_acquire() {
+  [ "$#" -eq 1 ] || return 2
+  local state lock pid started owner_start stale
+  state="${FASTUP_STATE:-$HOME/.cache/fastup}"
+  lock="$state/locks/$1"
+  mkdir -p "$(dirname "$lock")" || return 1
+  while ! mkdir "$lock" 2>/dev/null; do
+    pid="$(cat "$lock/pid" 2>/dev/null)"
+    started="$(cat "$lock/start" 2>/dev/null)"
+    if [ -n "$pid" ] && [ -n "$started" ]; then
+      owner_start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    else
+      owner_start=
+    fi
+    if [ -n "$pid" ] && [ -n "$owner_start" ] && [ "$owner_start" = "$started" ]; then
+      return 1
+    fi
+    stale="$lock.stale.$$"
+    [ -e "$stale" ] && stale="$lock.stale.$$.${RANDOM:-0}"
+    mv "$lock" "$stale" 2>/dev/null || continue
+  done
+  printf '%s\n' "$$" >"$lock/pid"
+  ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' >"$lock/start"
+}
+
+lock_release() {
+  [ "$#" -eq 1 ] || return 2
+  local state lock pid started current_start
+  state="${FASTUP_STATE:-$HOME/.cache/fastup}"
+  lock="$state/locks/$1"
+  pid="$(cat "$lock/pid" 2>/dev/null)"
+  started="$(cat "$lock/start" 2>/dev/null)"
+  current_start="$(ps -o lstart= -p "$$" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ "$pid" = "$$" ] && [ "$started" = "$current_start" ] || return 1
+  rm -f "$lock/pid" "$lock/start" && rmdir "$lock"
+}
+
+fastup_version_gt() {
+  local left="$1" right="$2"
+  awk -v a="$left" -v b="$right" 'BEGIN {
+    sub(/^[vV]/, "", a); sub(/^[vV]/, "", b)
+    na=split(a, aa, /[.+-]/); nb=split(b, bb, /[.+-]/)
+    for (i=1; i<=3; i++) {
+      x=(i<=na ? aa[i]+0 : 0); y=(i<=nb ? bb[i]+0 : 0)
+      if (x>y) exit 0
+      if (x<y) exit 1
+    }
+    exit 1
+  }'
+}
+
+fastup_update_one() {
+  local cli="$1" current rc payload
+  local detect_fn="${cli}_detect" current_fn="${cli}_current" resolve_fn="${cli}_resolve" install_fn="${cli}_install"
+  if ! command -v "$detect_fn" >/dev/null 2>&1 || ! command -v "$current_fn" >/dev/null 2>&1 ||
+      ! command -v "$resolve_fn" >/dev/null 2>&1 || ! command -v "$install_fn" >/dev/null 2>&1; then
+    printf '%s: not implemented yet\n' "$cli" >&2
+    return 1
+  fi
+  lock_acquire "$cli" || { printf '%s: update lock is held\n' "$cli" >&2; return 1; }
+  "$detect_fn" || { rc=$?; lock_release "$cli"; return "$rc"; }
+  current="$("$current_fn")" || { lock_release "$cli"; return 1; }
+  LATEST=
+  CANDIDATES=
+  "$resolve_fn" || { lock_release "$cli"; return 1; }
+  if [ -z "${LATEST:-}" ]; then
+    printf '%s: official latest version unavailable\n' "$cli" >&2
+    lock_release "$cli"
+    return 1
+  fi
+  if [ "${FASTUP_FORCE:-0}" != 1 ] && { [ "$current" = "$LATEST" ] || fastup_version_gt "$current" "$LATEST"; }; then
+    printf '%s: already current (%s)\n' "$cli" "$current"
+    lock_release "$cli"
+    return 0
+  fi
+  if [ "${FASTUP_CHECK:-0}" = 1 ]; then
+    printf '%s: update available (%s -> %s)\n' "$cli" "$current" "$LATEST"
+    lock_release "$cli"
+    return 10
+  fi
+  if [ "${FASTUP_DRY_RUN:-0}" = 1 ]; then
+    printf '%s: would update %s -> %s\n' "$cli" "$current" "$LATEST"
+    lock_release "$cli"
+    return 0
+  fi
+  payload="$(printf '%s\n' "${CANDIDATES:-}" | probe | fetch_verified "${FASTUP_STATE:-$HOME/.cache/fastup}/payload/$cli")" || {
+    lock_release "$cli"
+    return 1
+  }
+  "$install_fn" "$payload"
+  rc=$?
+  lock_release "$cli"
+  return "$rc"
+}
+
+fastup_main() {
+  local check=0 force=0 dry=0 verbose=0 via='' cli rc max_rc=0 name
+  local -a names
+  names=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h) fastup_usage; return 0 ;;
+      --check) check=1 ;;
+      --force) force=1 ;;
+      --dry-run) dry=1 ;;
+      -v) verbose=1 ;;
+      --via)
+        shift
+        if [ "$#" -eq 0 ] || [ -z "$1" ]; then fastup_usage >&2; return 2; fi
+        via="$1"
+        ;;
+      --via=*) via="${1#--via=}"; [ -n "$via" ] || { fastup_usage >&2; return 2; } ;;
+      --*) fastup_usage >&2; return 2 ;;
+      -*) fastup_usage >&2; return 2 ;;
+      claude|codex|omp|agy|all) names[${#names[@]}]="$1" ;;
+      *) fastup_usage >&2; return 2 ;;
+    esac
+    shift
+  done
+  [ "${#names[@]}" -gt 0 ] || { fastup_usage >&2; return 2; }
+  [ "$check" -eq 0 ] || FASTUP_CHECK=1
+  [ "$force" -eq 0 ] || FASTUP_FORCE=1
+  [ "$dry" -eq 0 ] || FASTUP_DRY_RUN=1
+  [ "$verbose" -eq 0 ] || FASTUP_VERBOSE=1
+  [ -z "$via" ] || FASTUP_VIA="$via"
+  for name in "${names[@]}"; do
+    if [ "$name" = all ]; then
+      for cli in claude codex omp agy; do
+        fastup_update_one "$cli"
+        rc=$?
+        [ "$rc" -le "$max_rc" ] || max_rc=$rc
+      done
+    else
+      fastup_update_one "$name"
+      rc=$?
+      [ "$rc" -le "$max_rc" ] || max_rc=$rc
+    fi
+  done
+  return "$max_rc"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  fastup_main "$@"
+  exit $?
+fi
