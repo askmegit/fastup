@@ -426,11 +426,14 @@ fastup_main() {
       for cli in claude codex omp agy; do
         fastup_update_one "$cli"
         rc=$?
+        # Providers return 4 for "not installed": skipped under `all`, an error when named explicitly.
+        if [ "$rc" -eq 4 ]; then printf '%s: not installed, skipped\n' "$cli"; rc=0; fi
         [ "$rc" -le "$max_rc" ] || max_rc=$rc
       done
     else
       fastup_update_one "$name"
       rc=$?
+      if [ "$rc" -eq 4 ]; then printf '%s: not installed\n' "$name" >&2; rc=3; fi
       [ "$rc" -le "$max_rc" ] || max_rc=$rc
     fi
   done
@@ -445,7 +448,7 @@ fastup_native_unsupported() {
 fastup_native_detect() {
   local cli="$1" target directory resolved magic
   target="$(command -v "$cli" 2>/dev/null)"
-  [ -n "$target" ] || { fastup_native_unsupported "$cli" "not installed"; return 3; }
+  [ -n "$target" ] || return 4
   [ -f "$target" ] && [ ! -L "$target" ] || {
     fastup_native_unsupported "$cli" "$target is not a regular file"; return 3;
   }
@@ -613,6 +616,7 @@ claude_detect() {
   CLAUDE_HOME_DIR="${FASTUP_CLAUDE_HOME:-$HOME/.local}"
   CLAUDE_LINK="$CLAUDE_HOME_DIR/bin/claude"
   CLAUDE_VERSIONS_DIR="$CLAUDE_HOME_DIR/share/claude/versions"
+  if [ ! -e "$CLAUDE_LINK" ] && [ ! -L "$CLAUDE_LINK" ] && ! command -v claude >/dev/null 2>&1; then return 4; fi
   [ -L "$CLAUDE_LINK" ] || { fastup_native_unsupported claude "not a native install at $CLAUDE_LINK"; return 3; }
   [ -d "$CLAUDE_VERSIONS_DIR" ] || { fastup_native_unsupported claude "$CLAUDE_VERSIONS_DIR is missing"; return 3; }
   target="$(readlink "$CLAUDE_LINK")" || { fastup_native_unsupported claude "cannot read $CLAUDE_LINK"; return 3; }
@@ -755,6 +759,7 @@ codex_detect() {
   CODEX_ROOT="$CODEX_HOME_DIR/packages/standalone"
   current="$CODEX_ROOT/current"
   releases="$CODEX_ROOT/releases"
+  if [ ! -e "$current" ] && [ ! -L "$current" ] && ! command -v codex >/dev/null 2>&1; then return 4; fi
   [ -L "$current" ] || { fastup_native_unsupported codex "$current is not a standalone release symlink"; return 3; }
   [ -d "$releases" ] || { fastup_native_unsupported codex "$releases is missing"; return 3; }
   resolved="$(cd "$current" 2>/dev/null && pwd -P)" || { fastup_native_unsupported codex "$current cannot be resolved"; return 3; }
@@ -786,8 +791,14 @@ codex_install() {
     [ ! -e "$stage/$path" ] || chmod 755 "$stage/$path" || { rm -rf "$stage"; return 1; }
   done
   ln -sf bin/codex "$stage/codex" || { rm -rf "$stage"; return 1; }
-  rm -rf "$release"
-  if ! mv "$stage" "$release"; then rm -rf "$stage"; return 1; fi
+  # Move an existing copy aside instead of deleting it first, so a failed mv cannot lose a live release.
+  if [ -e "$release" ]; then mv "$release" "$release.old.$$" || { rm -rf "$stage"; return 1; }; fi
+  if ! mv "$stage" "$release"; then
+    rm -rf "$stage"
+    [ ! -e "$release.old.$$" ] || mv "$release.old.$$" "$release"
+    return 1
+  fi
+  rm -rf "$release.old.$$"
   unset CODEX_RELEASE
   if [ -n "${FASTUP_CODEX_UPDATE_CMD:-}" ]; then
     CODEX_HOME="$CODEX_HOME_DIR" sh -c "$FASTUP_CODEX_UPDATE_CMD"; update_rc=$?

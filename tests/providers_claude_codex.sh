@@ -157,3 +157,25 @@ t_codex_already_latest_no_download() {
   [ $rc -eq 0 ] && ! grep -q "codex-package-$CX_TARGET.tar.gz" "$LOG" && ok codex_already_latest_no_download ||
     bad codex_already_latest_no_download "rc=$rc"
 }
+
+t_all_skips_not_installed() {
+  # only omp is installed; claude/codex/agy are absent -> `all` must skip them and succeed
+  omp_release v18.8.4 "$BASE/omp/$OMP_ASSET" "$OMP_NEW256"
+  BIN="$(mktemp -d "$WORK/bin.XXXXXX")"
+  mkbin "$BIN/omp" "omp/18.8.4"
+  empty="$(mktemp -d "$WORK/empty.XXXXXX")"
+  HOME="$empty" CODEX_HOME="$empty/.codex" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" \
+    FASTUP_OMP_API="$BASE/omp/latest.json" FASTUP_CLAUDE_BASE="$BASE/claude" FASTUP_CODEX_RELEASES="$BASE/codex" \
+    FASTUP_AGY_MANIFEST="$BASE/agy/darwin_$AGY_ARCH.json" FASTUP_NPM_REGISTRY="$BASE/no-npm" \
+    FASTUP_GH_PROXIES="" FASTUP_PROXIES="" FASTUP_STATE="$empty/state" \
+    "${TEST_BASH:-/bin/bash}" "$FASTUP" all >"$WORK/out" 2>&1; rc=$?
+  [ $rc -eq 0 ] && grep -q 'claude: not installed' "$WORK/out" && grep -q 'agy: not installed' "$WORK/out" &&
+    ok all_skips_not_installed || bad all_skips_not_installed "rc=$rc out=$(tr '\n' '|' <"$WORK/out")"
+}
+
+t_explicit_not_installed_is_3() {
+  empty="$(mktemp -d "$WORK/empty.XXXXXX")"
+  HOME="$empty" PATH="/usr/bin:/bin" FASTUP_STATE="$empty/state" \
+    "${TEST_BASH:-/bin/bash}" "$FASTUP" agy >/dev/null 2>&1; rc=$?
+  [ $rc -eq 3 ] && ok explicit_not_installed_is_3 || bad explicit_not_installed_is_3 "rc=$rc (want 3)"
+}
