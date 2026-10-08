@@ -8,6 +8,7 @@ Serves files under <root-dir>. Query parameters:
   status=<code>      reply with this status and an HTML body instead of the file
   norange=1          ignore Range headers (always 200 + full body)
   redirect=<url>     reply 302 to <url>
+  notype=1           send no Content-Type header
 Every request is appended to <request-log> as
 "<METHOD> <path?query> <Range or -> auth=<Authorization or ->".
 Writes the chosen port to <port-file> once listening.
@@ -79,7 +80,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(206 if partial else 200)
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
-        self.send_header("Content-Type", "application/octet-stream")
+        if q.get("notype") != "1":
+            self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
