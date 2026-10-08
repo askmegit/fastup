@@ -442,6 +442,7 @@ fastup_record_rc() {
     1) max_rc=1 ;;
     3) [ "$max_rc" -eq 1 ] || max_rc=3 ;;
     10) [ "$max_rc" -eq 0 ] && max_rc=10 ;;
+    *) [ "$2" -eq 0 ] || max_rc=1 ;;
   esac
 }
 
@@ -807,10 +808,11 @@ codex_resolve() {
   case "$digest" in *[!0-9a-f]*) fastup_resolve_error codex "invalid checksum for $asset"; return 1 ;; esac
   [ -n "$url" ] || { fastup_resolve_error codex "release $tag has no asset $asset"; return 1; }
   LATEST="$version"
-  CANDIDATES="$(printf '%s\tsha256\t%s\ttgz:.\n' "$url" "$digest"
-    gh_candidates "${FASTUP_CODEX_GITHUB:-https://github.com/openai/codex/releases/download}/rust-v$version/$asset" sha256 "$digest" tgz:. |
-      awk -F '\t' -v direct="$url" '$1 != direct'
-    npm_candidates @openai/codex "$version-darwin-$npm_arch" "tgz:package/vendor/$target")" || { fastup_resolve_error codex 'cannot build official release candidates'; return 1; }
+  # GitHub lines first so a --via prefix is tried first; the official URL is dropped when it is the GitHub copy.
+  CANDIDATES="$({ gh_candidates "${FASTUP_CODEX_GITHUB:-https://github.com/openai/codex/releases/download}/rust-v$version/$asset" sha256 "$digest" tgz:.
+    printf '%s\tsha256\t%s\ttgz:.\n' "$url" "$digest"
+    npm_candidates @openai/codex "$version-darwin-$npm_arch" "tgz:package/vendor/$target"; } |
+      awk -F '\t' '!seen[$1]++')" || { fastup_resolve_error codex 'cannot build official release candidates'; return 1; }
 }
 
 
@@ -869,7 +871,10 @@ codex_install() {
   # switch to a half-copied release; release it before running that same installer below.
   if [ -x /usr/bin/lockf ]; then
     script="${BASH_SOURCE[0]}"
-    /usr/bin/lockf -k "$CODEX_ROOT/install.lock" bash -c "source \"\$1\"; CODEX_ROOT=\"\$2\"; LATEST=\"\$3\"; CODEX_TARGET=\"\$4\"; codex_install_locked \"\$5\"" _ "$script" "$CODEX_ROOT" "$LATEST" "$CODEX_TARGET" "$payload"
+    # Absolute, or `source` would search PATH and could load a different installed fastup.
+    case "$script" in /*) ;; *) script="$PWD/$script" ;; esac
+    # The trap removes this child's stage if it is interrupted mid-copy (on success the stage was renamed).
+    /usr/bin/lockf -k "$CODEX_ROOT/install.lock" "$BASH" -c "trap 'rm -rf \"\$CODEX_ROOT/releases/.fastup-stage.\"*\".\$\$\"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; source \"\$1\"; CODEX_ROOT=\"\$2\"; LATEST=\"\$3\"; CODEX_TARGET=\"\$4\"; codex_install_locked \"\$5\"" _ "$script" "$CODEX_ROOT" "$LATEST" "$CODEX_TARGET" "$payload"
     lock_rc=$?
   else
     codex_install_locked "$payload"

@@ -129,3 +129,22 @@ t_codex_update_is_noninteractive() { # review open question
   [ $rc -eq 0 ] && [ "$(codex_now)" = 0.161.0 ] && ok codex_update_is_noninteractive ||
     bad codex_update_is_noninteractive "rc=$rc (codex update must run with CODEX_NON_INTERACTIVE=1)"
 }
+
+t_codex_via_first_on_github_metadata() { # re-review A
+  # metadata whose download URL is the GitHub copy (the api.github.com fallback shape)
+  local asset="codex-package-$CX_TARGET.tar.gz"
+  mkdir -p "$ROOT/cxgh/channels"
+  printf '{"tag_name":"rust-v0.161.0","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s"}]}\n' \
+    "$asset" "$(sha256 "$ROOT/codex/releases/0.161.0/$asset")" "$BASE/gh/rust-v0.161.0/$asset" >"$ROOT/cxgh/channels/latest"
+  got="$(FASTUP_VIA="$BASE/v/" FASTUP_CODEX_RELEASES="$BASE/cxgh" FASTUP_CODEX_GITHUB="$BASE/gh" \
+    lib 'codex_resolve && printf "%s\n" "$CANDIDATES"' 2>/dev/null | cut -f1)"
+  first="$(printf '%s\n' "$got" | head -1)"
+  dups="$(printf '%s\n' "$got" | sort | uniq -d)"
+  [ "$first" = "$BASE/v/$BASE/gh/rust-v0.161.0/$asset" ] && [ -z "$dups" ] && ok codex_via_first_on_github_metadata ||
+    bad codex_via_first_on_github_metadata "--via must be tried first, no duplicates; got: $(echo $got)"
+}
+
+t_unknown_rc_is_failure() { # re-review D
+  max_rc=0; lib 'max_rc=0; fastup_record_rc x 127; exit $max_rc'; rc=$?
+  [ $rc -eq 1 ] && ok unknown_rc_is_failure || bad unknown_rc_is_failure "rc 127 recorded as $rc (want 1)"
+}
