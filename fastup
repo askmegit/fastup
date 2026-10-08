@@ -429,6 +429,162 @@ fastup_main() {
   return "$max_rc"
 }
 
+fastup_native_unsupported() {
+  printf '%s: unsupported install layout: %s; update it with the tool that installed it\n' "$1" "$2" >&2
+  return 3
+}
+
+fastup_native_detect() {
+  local cli="$1" target directory resolved magic
+  target="$(command -v "$cli" 2>/dev/null)"
+  [ -n "$target" ] || { fastup_native_unsupported "$cli" "not installed"; return 3; }
+  [ -f "$target" ] && [ ! -L "$target" ] || {
+    fastup_native_unsupported "$cli" "$target is not a regular file"; return 3;
+  }
+  directory="$(dirname "$target")"
+  [ -w "$directory" ] || {
+    fastup_native_unsupported "$cli" "$directory is not writable"; return 3;
+  }
+  resolved="$(cd "$directory" 2>/dev/null && pwd -P)/${target##*/}" || {
+    fastup_native_unsupported "$cli" "cannot resolve $target"; return 3;
+  }
+  case "$resolved" in
+    /opt/homebrew/*|/usr/local/Cellar/*|*/node_modules/*|*/.bun/*)
+      fastup_native_unsupported "$cli" "$resolved is managed by another installer"; return 3 ;;
+  esac
+  magic="$(od -An -tx1 -N4 "$target" | tr -d ' \n')"
+  case "$magic" in cffaedfe|cefaedfe|cafebabe) ;; *)
+    fastup_native_unsupported "$cli" "$target is not a Mach-O binary"; return 3 ;;
+  esac
+  case "$cli" in omp) OMP_TARGET="$target" ;; agy) AGY_TARGET="$target" ;; esac
+}
+
+omp_detect() { fastup_native_detect omp; }
+
+omp_current() {
+  local output
+  output="$("${OMP_TARGET:-}" --version 2>/dev/null)" || return 1
+  case "$output" in omp/*) printf '%s\n' "${output#omp/}" ;; *) return 1 ;; esac
+}
+
+omp_resolve() {
+  local api metadata tag asset digest url index name
+  local api_host
+  case "$(uname -m)" in
+    arm64) asset=omp-darwin-arm64 ;;
+    x86_64) asset=omp-darwin-x64 ;;
+    *) printf 'omp: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+  esac
+  api="${FASTUP_OMP_API:-https://api.github.com/repos/can1357/oh-my-pi/releases/latest}"
+  api_host="${api#*://}"
+  api_host="${api_host%%/*}"
+  api_host="${api_host%%:*}"
+  if [ "$api_host" = api.github.com ] && command -v gh >/dev/null 2>&1; then
+    metadata="$(gh api repos/can1357/oh-my-pi/releases/latest)" || return 1
+  elif [ "$api_host" = api.github.com ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+    metadata="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$api")" || return 1
+  else
+    metadata="$(curl -fsSL "$api")" || return 1
+  fi
+  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || return 1
+  index=0
+  while :; do
+    name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
+    if [ "$name" = "$asset" ]; then
+      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || return 1
+      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || return 1
+      break
+    fi
+    index=$((index + 1))
+  done
+  case "${digest:-}" in sha256:*) digest="${digest#sha256:}" ;; *) return 1 ;; esac
+  [ -n "${url:-}" ] || return 1
+  LATEST="${tag#v}"
+  CANDIDATES="$(gh_candidates "$url" sha256 "$digest" raw)" || return 1
+}
+
+agy_detect() { fastup_native_detect agy; }
+
+agy_current() {
+  "${AGY_TARGET:-}" --version 2>/dev/null
+}
+
+agy_candidates_for() {
+  [ "$#" -eq 2 ] || return 2
+  local url="$1" digest="$2" rest bucket object encoded prefixes index prefix
+  local -a proxy_list
+  printf '%s\tsha512\t%s\ttgz:antigravity\n' "$url" "$digest"
+  case "$url" in
+    https://storage.googleapis.com/*)
+      rest="${url#https://storage.googleapis.com/}"
+      case "$rest" in */*)
+        bucket="${rest%%/*}"
+        object="${rest#*/}"
+        encoded="${object//\//%2F}"
+        printf 'https://www.googleapis.com/download/storage/v1/b/%s/o/%s?alt=media\tsha512\t%s\ttgz:antigravity\n' "$bucket" "$encoded" "$digest"
+      esac ;;
+  esac
+  prefixes="${FASTUP_PROXIES:-}"
+  IFS=' ' read -r -a proxy_list <<EOF
+$prefixes
+EOF
+  index=0
+  while [ "$index" -lt "${#proxy_list[@]}" ]; do
+    prefix="${proxy_list[$index]}"
+    [ -n "$prefix" ] && printf '%s%s\tsha512\t%s\ttgz:antigravity\n' "$prefix" "$url" "$digest"
+    index=$((index + 1))
+  done
+  if [ -n "${FASTUP_VIA:-}" ]; then
+    printf '%s%s\tsha512\t%s\ttgz:antigravity\n' "$FASTUP_VIA" "$url" "$digest"
+  fi
+}
+
+agy_resolve() {
+  local arch metadata version url digest
+  case "$(uname -m)" in
+    arm64) arch=arm64 ;;
+    x86_64) arch=amd64 ;;
+    *) printf 'agy: unsupported architecture: %s\n' "$(uname -m)" >&2; return 1 ;;
+  esac
+  metadata="$(curl -fsSL "${FASTUP_AGY_MANIFEST:-https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_$arch.json}")" || return 1
+  version="$(printf '%s' "$metadata" | /usr/bin/plutil -extract version raw -o - - 2>/dev/null)" || return 1
+  url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract url raw -o - - 2>/dev/null)" || return 1
+  digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract sha512 raw -o - - 2>/dev/null)" || return 1
+  LATEST="$version"
+  CANDIDATES="$(agy_candidates_for "$url" "$digest")" || return 1
+}
+
+fastup_native_install() {
+  local cli="$1" target="$2" payload="$3" directory tmp backup old reported new
+  directory="$(dirname "$target")"
+  old="$("$target" --version 2>/dev/null)" || old=unknown
+  if [ "$cli" = omp ]; then old="${old#omp/}"; fi
+  tmp="$(mktemp "$directory/.fastup.XXXXXX")" || return 1
+  if ! cp "$payload" "$tmp" || ! chmod 755 "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  backup="$target.fastup-bak"
+  if ! mv -f "$target" "$backup"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$target"; then
+    mv -f "$backup" "$target"
+    return 1
+  fi
+  reported="$("$target" --version 2>/dev/null)" || reported=
+  new="$reported"
+  if [ "$cli" = omp ]; then new="${reported#omp/}"; fi
+  if [ "$new" != "$LATEST" ]; then
+    mv -f "$backup" "$target"
+    printf '%s: installed version %s does not match %s; rolled back\n' "$cli" "$new" "$LATEST" >&2
+    return 1
+  fi
+  rm -f "$backup"
+  printf '%s: updated %s -> %s\n' "$cli" "$old" "$new"
+}
+
+omp_install() { fastup_native_install omp "${OMP_TARGET:-}" "$1"; }
+agy_install() { fastup_native_install agy "${AGY_TARGET:-}" "$1"; }
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fastup_main "$@"
   exit $?
