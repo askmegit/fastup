@@ -6,7 +6,7 @@ macOS only in v0.1. Bash 3.2 compatible. Needs `curl`, `shasum`, `tar`, `openssl
 
 ## Install
 
-Homebrew (available once the tap is published):
+Homebrew:
 
 ```bash
 brew install askmegit/tap/fastup
