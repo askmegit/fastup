@@ -301,6 +301,9 @@ t_shellcheck_disable_budget() {
     bad shellcheck_disable_budget "at most 3 '# shellcheck disable' lines (found ${n:-?})"
 }
 
+# shellcheck source=tests/providers_omp_agy.sh
+. "$HERE/providers_omp_agy.sh"
+
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do run "$t"; done
 
 echo
