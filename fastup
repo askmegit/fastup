@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-FASTUP_VERSION=0.1.0
+FASTUP_VERSION=0.2.0
 
 fastup_usage() {
   cat <<'USAGE'
