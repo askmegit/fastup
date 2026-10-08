@@ -303,6 +303,8 @@ t_shellcheck_disable_budget() {
 
 # shellcheck source=tests/providers_omp_agy.sh
 . "$HERE/providers_omp_agy.sh"
+# shellcheck source=tests/providers_claude_codex.sh
+. "$HERE/providers_claude_codex.sh"
 
 for t in $(declare -F | awk '{print $3}' | grep '^t_'); do run "$t"; done
 
