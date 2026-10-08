@@ -23,11 +23,13 @@ $candidate
 EOF
   headers="$dir/headers.$index"
   body="$dir/body.$index"
-  meta="$(curl -L -r "0-$((bytes - 1))" --max-time "$timeout" -sS \
-    -D "$headers" -o >(head -c "$bytes" >"$body") \
-    -w '%{http_code}\t%{content_type}\t%{time_total}\t%{time_starttransfer}' \
-    "$url" 2>/dev/null)"
-  rc=$?
+  # A plain pipe (not >(...)) so the body is fully written before it is counted; %{stderr} keeps
+  # the write-out stats apart from the body.
+  curl -L -r "0-$((bytes - 1))" --max-time "$timeout" -sS -D "$headers" \
+    -w '%{stderr}\n%{http_code}\t%{content_type}\t%{time_total}\t%{time_starttransfer}' \
+    -o - "$url" 2>"$dir/meta.$index" | head -c "$bytes" >"$body"
+  rc=${PIPESTATUS[0]}
+  meta="$(tail -n 1 "$dir/meta.$index")"
   IFS=$'\t' read -r status content_type total_time start_time <<EOF
 $meta
 EOF
@@ -42,10 +44,12 @@ EOF
   [ "$file_size" -gt 0 ] 2>/dev/null || file_size="$bytes"
   lower_type="$(printf '%s' "$content_type" | tr '[:upper:]' '[:lower:]')"
   speed=0
-  if { [ "$rc" -eq 0 ] || { { [ "$rc" -eq 23 ] || [ "$rc" -eq 28 ]; } && [ "$count" -gt 0 ]; }; } &&
-      { [ "$status" = 200 ] || [ "$status" = 206 ]; } &&
-      { [ "$count" -ge "$bytes" ] || [ "$count" -ge "$file_size" ]; } &&
-      [ "${lower_type#text/html}" = "$lower_type" ]; then
+  # Valid: a 200/206 non-HTML body that either completed (all requested bytes, or the whole file)
+  # or was cut off by the probe timeout after receiving something -- a slow source, not a broken one.
+  if { [ "$status" = 200 ] || [ "$status" = 206 ]; } && [ "${lower_type#text/html}" = "$lower_type" ] &&
+      { { [ "$rc" -eq 28 ] && [ "$count" -gt 0 ]; } ||
+        { { [ "$rc" -eq 0 ] || [ "$rc" -eq 23 ]; } &&
+          { [ "$count" -ge "$bytes" ] || [ "$count" -ge "$file_size" ]; }; }; }; then
     speed="$(awk -v n="$count" -v total="$total_time" -v start="$start_time" \
       'BEGIN { elapsed=total-start; if (elapsed <= 0) elapsed=0.001; printf "%.0f", n/elapsed }')"
   fi
@@ -98,7 +102,7 @@ probe() {
   if [ "$count" -gt 0 ]; then
     sort -t "$tab" -k1,1nr -k2,2n "$dir"/result.* | cut -f3-
   fi
-  rm -f "$dir"/headers.* "$dir"/body.* "$dir"/result.*
+  rm -f "$dir"/headers.* "$dir"/body.* "$dir"/meta.* "$dir"/result.*
   rmdir "$dir"
 }
 
@@ -152,7 +156,7 @@ fastup_symlinks_safe() {
 
 fetch_verified() {
   [ "$#" -eq 1 ] || return 2
-  local outdir state partial_dir line url algo digest format speed actual stall rc inner payload extract_dir
+  local outdir state partial_dir partial url algo digest format speed actual stall min_speed inner payload extract_dir
   local out_abs candidate_seen
   outdir="$1"
   mkdir -p "$outdir" || return 1
@@ -179,10 +183,11 @@ fetch_verified() {
     case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
     stall="${FASTUP_STALL_TIME:-30}"
     case "$stall" in ''|*[!0-9]*|0) stall=30 ;; esac
-    stall=$((speed / 4))
-    [ "$stall" -ge 1024 ] || stall=1024
-    if curl -fL -C - --retry 2 --speed-limit "$stall" --speed-time "${FASTUP_STALL_TIME:-30}" \
-      -o "$partial" "$url"; then
+    min_speed=$((speed / 4))
+    [ "$min_speed" -ge 1024 ] || min_speed=1024
+    # A complete partial left by an earlier run would make `curl -C -` fail with 416, so check it first.
+    if { [ -f "$partial" ] && [ "$(fastup_hash_file "$partial" "$algo")" = "$digest" ]; } ||
+      curl -fL -C - --retry 2 --speed-limit "$min_speed" --speed-time "$stall" -o "$partial" "$url"; then
       actual="$(fastup_hash_file "$partial" "$algo")" || actual=
       if [ "$actual" != "$digest" ]; then
         printf 'fastup: checksum mismatch for %s\n' "$url" >&2
@@ -215,11 +220,9 @@ fetch_verified() {
         rm -rf "$extract_dir"
         continue
       fi
+      rm -f "$partial"
       printf '%s\n' "$payload"
       return 0
-    else
-      rc=$?
-      [ "$rc" -eq 0 ] || :
     fi
   done
   if [ "$candidate_seen" -eq 0 ]; then
@@ -230,7 +233,7 @@ fetch_verified() {
 
 gh_candidates() {
   [ "$#" -eq 4 ] || return 2
-  local url="$1" algo="$2" digest="$3" format="$4" prefixes prefix
+  local url="$1" algo="$2" digest="$3" format="$4" prefixes prefix index
   printf '%s\t%s\t%s\t%s\n' "$url" "$algo" "$digest" "$format"
   if [ -n "${FASTUP_VIA:-}" ]; then
     printf '%s\t%s\t%s\t%s\n' "${FASTUP_VIA}${url}" "$algo" "$digest" "$format"
@@ -255,7 +258,7 @@ EOF
 
 npm_candidates() {
   [ "$#" -eq 3 ] || return 2
-  local pkg="$1" version="$2" format="$3" registry metadata tarball integrity encoded digest path mirrors mirror
+  local pkg="$1" version="$2" format="$3" registry metadata tarball integrity encoded digest path mirrors mirror index
   registry="${FASTUP_NPM_REGISTRY:-https://registry.npmjs.org}"
   registry="${registry%/}"
   metadata="$(curl -fsSL "$registry/$pkg/$version" 2>/dev/null)" || return 0

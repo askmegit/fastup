@@ -234,6 +234,23 @@ t_fetch_resumes_partial() {
   rm -rf "$FASTUP_STATE/partial"
 }
 
+t_fetch_reuses_complete_partial() {
+  # a previous run left a complete, valid download behind; no source is reachable now
+  out="$WORK/f11"; mkdir -p "$out" "$FASTUP_STATE/partial"
+  cp "$ROOT/good.tgz" "$FASTUP_STATE/partial/$TGZ512"
+  p="$(line "$BASE/gone.tgz" sha512 "$TGZ512" "tgz:package/bin/tool" | lib "fetch_verified '$out'" 2>/dev/null)"
+  [ -x "$p" ] && [ ! -e "$FASTUP_STATE/partial/$TGZ512" ] && ok fetch_reuses_complete_partial ||
+    bad fetch_reuses_complete_partial "a complete verified partial must be used (and then removed); payload=$p"
+  rm -rf "$FASTUP_STATE/partial"
+}
+
+t_fetch_tgz_cleans_partial() {
+  out="$WORK/f12"; mkdir -p "$out"
+  line "$BASE/good.tgz" sha512 "$TGZ512" "tgz:package" | lib "fetch_verified '$out'" >/dev/null 2>&1
+  [ ! -e "$FASTUP_STATE/partial/$TGZ512" ] && ok fetch_tgz_cleans_partial ||
+    bad fetch_tgz_cleans_partial "partial left behind after a successful tgz fetch"
+}
+
 t_downloads_never_send_auth() {
   out="$WORK/f8"; mkdir -p "$out"
   : >"$LOG"
