@@ -50,9 +50,17 @@ tar -czf "$ROOT/good.tgz" -C "$WORK/pkg" package
 TGZ512="$(sha512 "$ROOT/good.tgz")"
 
 # tarball whose member escapes the extraction dir
-mkdir -p "$WORK/trav/a"
-printf 'pwned\n' >"$WORK/trav/evil"
-(cd "$WORK/trav/a" && tar -czf "$ROOT/trav.tgz" ../evil 2>/dev/null)
+# GNU tar strips ../ while creating an archive; construct the hostile name explicitly.
+python3 - "$ROOT/trav.tgz" <<'PY'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    member = tarfile.TarInfo("../evil")
+    member.size = 6
+    archive.addfile(member, io.BytesIO(b"pwned\n"))
+PY
 TRAV512="$(sha512 "$ROOT/trav.tgz")"
 
 # npm registry metadata fixture (official registry + one mirror serve the same tarball)
