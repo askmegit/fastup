@@ -567,9 +567,9 @@ fastup_native_detect() {
   local cli="$1" target directory resolved magic system
   target="$(command -v "$cli" 2>/dev/null)"
   [ -n "$target" ] || return 4
-  [ -f "$target" ] && [ ! -L "$target" ] || {
+  if [ ! -f "$target" ] || [ -L "$target" ]; then
     fastup_native_unsupported "$cli" "$target is not a regular file"; return 3;
-  }
+  fi
   directory="$(dirname "$target")"
   [ -w "$directory" ] || {
     fastup_native_unsupported "$cli" "$directory is not writable"; return 3;
