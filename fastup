@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-FASTUP_VERSION=0.2.0
+FASTUP_VERSION=0.3.0
 
 fastup_usage() {
   cat <<'USAGE'
@@ -16,6 +16,48 @@ Options:
   --version        Print the fastup version
   -h, --help       Show this help
 USAGE
+}
+
+fastup_json_get() {
+  local path="$1" file="${2:--}"
+  if [ -x /usr/bin/plutil ]; then
+    /usr/bin/plutil -extract "$path" raw -expect string -o - "$file"
+    return
+  fi
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c '
+import json
+import sys
+
+path, filename = sys.argv[1], sys.argv[2]
+if filename == "-":
+    value = json.load(sys.stdin)
+else:
+    with open(filename) as handle:
+        value = json.load(handle)
+for part in path.split("."):
+    value = value[int(part)] if isinstance(value, list) else value[part]
+if not isinstance(value, str):
+    raise ValueError("JSON value is not a string")
+sys.stdout.write(value)
+' "$path" "$file"
+}
+
+fastup_linux_libc_suffix() {
+  if [ "$(uname -s)" = Linux ] && command -v ldd >/dev/null 2>&1 &&
+    ldd --version 2>&1 | head -n 1 | grep -qi musl; then
+    printf '%s\n' '-musl'
+  fi
+}
+
+fastup_base64_decode() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl base64 -d -A
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+  else
+    return 1
+  fi
 }
 
 fastup_probe_one() {
@@ -115,11 +157,20 @@ probe() {
 }
 
 fastup_hash_file() {
-  case "$2" in
-    sha256) shasum -a 256 "$1" | awk '{print $1}' ;;
-    sha512) shasum -a 512 "$1" | awk '{print $1}' ;;
-    *) return 1 ;;
-  esac
+  local algo="$2"
+  if command -v shasum >/dev/null 2>&1; then
+    case "$algo" in
+      sha256) shasum -a 256 "$1" | awk '{print $1}' ;;
+      sha512) shasum -a 512 "$1" | awk '{print $1}' ;;
+      *) return 1 ;;
+    esac
+  else
+    case "$algo" in
+      sha256) command -v sha256sum >/dev/null 2>&1 && sha256sum "$1" | awk '{print $1}' ;;
+      sha512) command -v sha512sum >/dev/null 2>&1 && sha512sum "$1" | awk '{print $1}' ;;
+      *) return 1 ;;
+    esac
+  fi
 }
 
 fastup_safe_inner_path() {
@@ -274,10 +325,10 @@ npm_candidates() {
   registry="${FASTUP_NPM_REGISTRY:-https://registry.npmjs.org}"
   registry="${registry%/}"
   metadata="$(curl -fsSL "$registry/$pkg/$version" 2>/dev/null)" || return 0
-  tarball="$(printf '%s' "$metadata" | /usr/bin/plutil -extract dist.tarball raw -o - - 2>/dev/null)" || return 0
-  integrity="$(printf '%s' "$metadata" | /usr/bin/plutil -extract dist.integrity raw -o - - 2>/dev/null)" || return 0
+  tarball="$(printf '%s' "$metadata" | fastup_json_get dist.tarball - 2>/dev/null)" || return 0
+  integrity="$(printf '%s' "$metadata" | fastup_json_get dist.integrity - 2>/dev/null)" || return 0
   case "$integrity" in sha512-*) encoded="${integrity#sha512-}" ;; *) return 0 ;; esac
-  digest="$(printf '%s' "$encoded" | openssl base64 -d -A 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  digest="$(printf '%s' "$encoded" | fastup_base64_decode 2>/dev/null | od -An -tx1 | tr -d ' \n')"
   [ "${#digest}" -eq 128 ] || return 0
   case "$tarball" in "$registry"/*) path="${tarball#"$registry"}" ;; *) return 0 ;; esac
   printf '%s\tsha512\t%s\t%s\n' "$tarball" "$digest" "$format"
@@ -366,9 +417,11 @@ fastup_version_gt() {
 }
 
 fastup_cleanup_update() {
+  [ -z "${FASTUP_CLEANUP_SELF_TMP:-}" ] || rm -f "$FASTUP_CLEANUP_SELF_TMP"
   [ -z "${FASTUP_CLEANUP_WORK:-}" ] || rm -rf "$FASTUP_CLEANUP_WORK"
   [ -z "${FASTUP_CLEANUP_LOCK:-}" ] || lock_release "$FASTUP_CLEANUP_LOCK"
   FASTUP_CLEANUP_WORK=
+  FASTUP_CLEANUP_SELF_TMP=
   FASTUP_CLEANUP_LOCK=
 }
 
@@ -511,7 +564,7 @@ fastup_native_unsupported() {
 }
 
 fastup_native_detect() {
-  local cli="$1" target directory resolved magic
+  local cli="$1" target directory resolved magic system
   target="$(command -v "$cli" 2>/dev/null)"
   [ -n "$target" ] || return 4
   [ -f "$target" ] && [ ! -L "$target" ] || {
@@ -525,12 +578,14 @@ fastup_native_detect() {
     fastup_native_unsupported "$cli" "cannot resolve $target"; return 3;
   }
   case "$resolved" in
-    /opt/homebrew/*|/usr/local/Cellar/*|*/node_modules/*|*/.bun/*)
+    /opt/homebrew/*|/usr/local/Cellar/*|/home/linuxbrew/.linuxbrew/*|*/node_modules/*|*/.bun/*)
       fastup_native_unsupported "$cli" "$resolved is managed by another installer"; return 3 ;;
   esac
+  system="$(uname -s)"
   magic="$(od -An -tx1 -N4 "$target" | tr -d ' \n')"
-  case "$magic" in cffaedfe|cefaedfe|cafebabe) ;; *)
-    fastup_native_unsupported "$cli" "$target is not a Mach-O binary"; return 3 ;;
+  case "$system:$magic" in
+    Darwin:cffaedfe|Darwin:cefaedfe|Darwin:cafebabe|Linux:7f454c46) ;;
+    *) fastup_native_unsupported "$cli" "$target is not a $system executable"; return 3 ;;
   esac
   case "$cli" in omp) OMP_TARGET="$target" ;; agy) AGY_TARGET="$target" ;; esac
 }
@@ -549,13 +604,20 @@ fastup_resolve_error() {
 }
 
 omp_resolve() {
-  local api metadata tag asset digest url index name
+  local api metadata tag asset digest url index name system arch libc
   local api_host
-  case "$(uname -m)" in
-    arm64) asset=omp-darwin-arm64 ;;
-    x86_64) asset=omp-darwin-x64 ;;
-    *) fastup_resolve_error omp "unsupported architecture $(uname -m)"; return 1 ;;
+  system="$(uname -s)"
+  case "$system:$(uname -m)" in
+    Darwin:arm64) asset=omp-darwin-arm64 ;;
+    Darwin:x86_64|Darwin:amd64) asset=omp-darwin-x64 ;;
+    Linux:arm64|Linux:aarch64) arch=arm64 ;;
+    Linux:x86_64|Linux:amd64) arch=x64 ;;
+    *) fastup_resolve_error omp "unsupported platform $system $(uname -m)"; return 1 ;;
   esac
+  if [ "$system" = Linux ]; then
+    libc="$(fastup_linux_libc_suffix)"
+    if [ "$libc" = -musl ]; then asset="omp-linux-musl-$arch"; else asset="omp-linux-$arch"; fi
+  fi
   api="${FASTUP_OMP_API:-https://api.github.com/repos/can1357/oh-my-pi/releases/latest}"
   api_host="${api#*://}"
   api_host="${api_host%%/*}"
@@ -568,14 +630,14 @@ omp_resolve() {
   else
     metadata="$(curl -fsSL "$api")" || { fastup_resolve_error omp 'cannot fetch official release metadata'; return 1; }
   fi
-  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || { fastup_resolve_error omp 'official release metadata has no tag'; return 1; }
+  tag="$(printf '%s' "$metadata" | fastup_json_get tag_name - 2>/dev/null)" || { fastup_resolve_error omp 'official release metadata has no tag'; return 1; }
   index=0
   digest=; url=
   while :; do
-    name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
+    name="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.name" - 2>/dev/null)" || break
     if [ "$name" = "$asset" ]; then
-      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || { fastup_resolve_error omp "asset $asset has no checksum"; return 1; }
-      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || { fastup_resolve_error omp "asset $asset has no download URL"; return 1; }
+      digest="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.digest" - 2>/dev/null)" || { fastup_resolve_error omp "asset $asset has no checksum"; return 1; }
+      url="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.browser_download_url" - 2>/dev/null)" || { fastup_resolve_error omp "asset $asset has no download URL"; return 1; }
       break
     fi
     index=$((index + 1))
@@ -623,16 +685,18 @@ EOF
 }
 
 agy_resolve() {
-  local arch metadata version url digest
-  case "$(uname -m)" in
-    arm64) arch=arm64 ;;
-    x86_64) arch=amd64 ;;
-    *) fastup_resolve_error agy "unsupported architecture $(uname -m)"; return 1 ;;
+  local arch metadata version url digest system manifest_name
+  system="$(uname -s)"
+  case "$system:$(uname -m)" in
+    Darwin:arm64|Linux:arm64|Linux:aarch64) arch=arm64 ;;
+    Darwin:x86_64|Darwin:amd64|Linux:x86_64|Linux:amd64) arch=amd64 ;;
+    *) fastup_resolve_error agy "unsupported platform $system $(uname -m)"; return 1 ;;
   esac
-  metadata="$(curl -fsSL "${FASTUP_AGY_MANIFEST:-https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_$arch.json}")" || { fastup_resolve_error agy 'cannot fetch official release metadata'; return 1; }
-  version="$(printf '%s' "$metadata" | /usr/bin/plutil -extract version raw -o - - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no version'; return 1; }
-  url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract url raw -o - - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no asset URL'; return 1; }
-  digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract sha512 raw -o - - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no SHA-512 checksum'; return 1; }
+  if [ "$system" = Linux ]; then manifest_name=linux; else manifest_name=darwin; fi
+  metadata="$(curl -fsSL "${FASTUP_AGY_MANIFEST:-https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${manifest_name}_$arch.json}")" || { fastup_resolve_error agy 'cannot fetch official release metadata'; return 1; }
+  version="$(printf '%s' "$metadata" | fastup_json_get version - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no version'; return 1; }
+  url="$(printf '%s' "$metadata" | fastup_json_get url - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no asset URL'; return 1; }
+  digest="$(printf '%s' "$metadata" | fastup_json_get sha512 - 2>/dev/null)" || { fastup_resolve_error agy 'official manifest has no SHA-512 checksum'; return 1; }
   LATEST="$version"
   CANDIDATES="$(agy_candidates_for "$url" "$digest")" || { fastup_resolve_error agy 'cannot build download candidates'; return 1; }
 }
@@ -705,24 +769,31 @@ claude_current() {
 }
 
 claude_resolve() {
-  local channel metadata version manifest platform checksum translated
+  local channel metadata version manifest platform checksum translated system arch libc
   channel=latest
   if [ -f "$HOME/.claude/settings.json" ]; then
-    channel="$(/usr/bin/plutil -extract autoUpdatesChannel raw -o - "$HOME/.claude/settings.json" 2>/dev/null)" || channel=latest
+    channel="$(fastup_json_get autoUpdatesChannel "$HOME/.claude/settings.json" 2>/dev/null)" || channel=latest
     [ -n "$channel" ] || channel=latest
   fi
   CLAUDE_BASE="${FASTUP_CLAUDE_BASE:-https://downloads.claude.ai/claude-code-releases}"
   version="$(curl -fsSL "${CLAUDE_BASE%/}/$channel")" || { fastup_resolve_error claude 'cannot fetch official release version'; return 1; }
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fastup_resolve_error claude "invalid official version: $version"; return 1; }
-  case "$(uname -m)" in
-    arm64) platform=darwin-arm64 ;;
-    x86_64)
+  system="$(uname -s)"
+  case "$system:$(uname -m)" in
+    Darwin:arm64) platform=darwin-arm64 ;;
+    Darwin:x86_64|Darwin:amd64)
       translated="$(sysctl -in sysctl.proc_translated 2>/dev/null)" || translated=0
       if [ "$translated" = 1 ]; then platform=darwin-arm64; else platform=darwin-x64; fi ;;
-    *) fastup_resolve_error claude "unsupported architecture $(uname -m)"; return 1 ;;
+    Linux:arm64|Linux:aarch64) arch=arm64 ;;
+    Linux:x86_64|Linux:amd64) arch=x64 ;;
+    *) fastup_resolve_error claude "unsupported platform $system $(uname -m)"; return 1 ;;
   esac
+  if [ "$system" = Linux ]; then
+    libc="$(fastup_linux_libc_suffix)"
+    if [ "$libc" = -musl ]; then platform="linux-$arch-musl"; else platform="linux-$arch"; fi
+  fi
   manifest="$(curl -fsSL "${CLAUDE_BASE%/}/$version/manifest.json")" || { fastup_resolve_error claude "cannot fetch official manifest for $version"; return 1; }
-  checksum="$(printf '%s' "$manifest" | /usr/bin/plutil -extract "platforms.$platform.checksum" raw -o - - 2>/dev/null)" || { fastup_resolve_error claude "manifest has no checksum for $platform"; return 1; }
+  checksum="$(printf '%s' "$manifest" | fastup_json_get "platforms.$platform.checksum" - 2>/dev/null)" || { fastup_resolve_error claude "manifest has no checksum for $platform"; return 1; }
   case "$checksum" in
     ????????????????????????????????????????????????????????????????) ;;
     *) fastup_resolve_error claude 'invalid official SHA-256 checksum'; return 1 ;;
@@ -774,11 +845,13 @@ claude_install() {
 
 
 codex_resolve() {
-  local npm_arch target asset metadata api api_host tag version digest url index name
-  case "$(uname -m)" in
-    arm64) npm_arch=arm64; target=aarch64-apple-darwin ;;
-    x86_64) npm_arch=x64; target=x86_64-apple-darwin ;;
-    *) fastup_resolve_error codex "unsupported architecture $(uname -m)"; return 1 ;;
+  local npm_arch npm_os target asset metadata api api_host tag version digest url index name system
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) npm_os=darwin; npm_arch=arm64; target=aarch64-apple-darwin ;;
+    Darwin:x86_64|Darwin:amd64) npm_os=darwin; npm_arch=x64; target=x86_64-apple-darwin ;;
+    Linux:arm64|Linux:aarch64) npm_os=linux; npm_arch=arm64; target=aarch64-unknown-linux-musl ;;
+    Linux:x86_64|Linux:amd64) npm_os=linux; npm_arch=x64; target=x86_64-unknown-linux-musl ;;
+    *) fastup_resolve_error codex "unsupported platform $(uname -s) $(uname -m)"; return 1 ;;
   esac
   asset="codex-package-$target.tar.gz"
   api="${FASTUP_CODEX_RELEASES:-https://releases.openai.com/codex}"
@@ -796,15 +869,15 @@ codex_resolve() {
       metadata="$(curl -fsSL "$api")" || { fastup_resolve_error codex 'cannot fetch official release metadata'; return 1; }
     fi
   fi
-  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || { fastup_resolve_error codex 'official release metadata has no tag'; return 1; }
+  tag="$(printf '%s' "$metadata" | fastup_json_get tag_name - 2>/dev/null)" || { fastup_resolve_error codex 'official release metadata has no tag'; return 1; }
   case "$tag" in rust-v*) version="${tag#rust-v}" ;; *) fastup_resolve_error codex "invalid official release tag: $tag"; return 1 ;; esac
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?$ ]] || { fastup_resolve_error codex "invalid official release version: $version"; return 1; }
   index=0; url=; digest=
   while :; do
-    name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
+    name="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.name" - 2>/dev/null)" || break
     if [ "$name" = "$asset" ]; then
-      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || { fastup_resolve_error codex "asset $asset has no checksum"; return 1; }
-      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || { fastup_resolve_error codex "asset $asset has no download URL"; return 1; }
+      digest="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.digest" - 2>/dev/null)" || { fastup_resolve_error codex "asset $asset has no checksum"; return 1; }
+      url="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.browser_download_url" - 2>/dev/null)" || { fastup_resolve_error codex "asset $asset has no download URL"; return 1; }
       break
     fi
     index=$((index + 1))
@@ -820,7 +893,7 @@ codex_resolve() {
   # GitHub lines first so a --via prefix is tried first; the official URL is dropped when it is the GitHub copy.
   CANDIDATES="$({ gh_candidates "${FASTUP_CODEX_GITHUB:-https://github.com/openai/codex/releases/download}/rust-v$version/$asset" sha256 "$digest" tgz:.
     printf '%s\tsha256\t%s\ttgz:.\n' "$url" "$digest"
-    npm_candidates @openai/codex "$version-darwin-$npm_arch" "tgz:package/vendor/$target"; } |
+    npm_candidates @openai/codex "$version-$npm_os-$npm_arch" "tgz:package/vendor/$target"; } |
       awk -F '\t' '!seen[$1]++')" || { fastup_resolve_error codex 'cannot build official release candidates'; return 1; }
 }
 
@@ -837,7 +910,13 @@ codex_detect() {
   resolved="$(cd "$current" 2>/dev/null && pwd -P)" || { fastup_native_unsupported codex "$current cannot be resolved"; return 3; }
   releases="$(cd "$releases" 2>/dev/null && pwd -P)" || { fastup_native_unsupported codex "$releases is unavailable"; return 3; }
   case "$resolved" in "$releases"/*) ;; *) fastup_native_unsupported codex "$current does not resolve into $releases"; return 3 ;; esac
-  case "$(uname -m)" in arm64) CODEX_TARGET=aarch64-apple-darwin ;; x86_64) CODEX_TARGET=x86_64-apple-darwin ;; *) fastup_native_unsupported codex "unsupported architecture $(uname -m)"; return 3 ;; esac
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) CODEX_TARGET=aarch64-apple-darwin ;;
+    Darwin:x86_64|Darwin:amd64) CODEX_TARGET=x86_64-apple-darwin ;;
+    Linux:arm64|Linux:aarch64) CODEX_TARGET=aarch64-unknown-linux-musl ;;
+    Linux:x86_64|Linux:amd64) CODEX_TARGET=x86_64-unknown-linux-musl ;;
+    *) fastup_native_unsupported codex "unsupported platform $(uname -s) $(uname -m)"; return 3 ;;
+  esac
   if [ -x "$current/bin/codex" ]; then CODEX_CURRENT_BIN="$current/bin/codex"
   elif [ -x "$current/codex" ]; then CODEX_CURRENT_BIN="$current/codex"
   else fastup_native_unsupported codex "$current has no executable codex binary"; return 3
@@ -878,7 +957,21 @@ codex_install() {
   release="$CODEX_ROOT/releases/$LATEST-$CODEX_TARGET"
   # Hold the official installer's lock while staging, so a concurrent `codex update` cannot clean up or
   # switch to a half-copied release; release it before running that same installer below.
-  if [ -x /usr/bin/lockf ]; then
+  if [ "$(uname -s)" = Linux ]; then
+    command -v flock >/dev/null 2>&1 || {
+      printf 'codex: flock (util-linux) is required on Linux for the official install lock\n' >&2
+      return 1
+    }
+    (
+      trap 'rm -rf "$CODEX_ROOT/releases/.fastup-stage.$LATEST-$CODEX_TARGET.$$"' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      exec 9>"$CODEX_ROOT/install.lock" || exit 1
+      flock 9 || exit 1
+      codex_install_locked "$payload"
+    )
+    lock_rc=$?
+  elif [ -x /usr/bin/lockf ]; then
     script="${BASH_SOURCE[0]}"
     # Absolute, or `source` would search PATH and could load a different installed fastup.
     case "$script" in /*) ;; *) script="$PWD/$script" ;; esac
@@ -934,15 +1027,15 @@ self_resolve() {
   else
     metadata="$(curl -fsSL "$api")" || { fastup_resolve_error self 'cannot fetch release metadata'; return 1; }
   fi
-  tag="$(printf '%s' "$metadata" | /usr/bin/plutil -extract tag_name raw -o - - 2>/dev/null)" || { fastup_resolve_error self 'release metadata has no tag'; return 1; }
+  tag="$(printf '%s' "$metadata" | fastup_json_get tag_name - 2>/dev/null)" || { fastup_resolve_error self 'release metadata has no tag'; return 1; }
   case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fastup_resolve_error self "unexpected release tag $tag"; return 1 ;; esac
   index=0
   digest=; url=
   while :; do
-    name="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.name" raw -o - - 2>/dev/null)" || break
+    name="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.name" - 2>/dev/null)" || break
     if [ "$name" = fastup ]; then
-      digest="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.digest" raw -o - - 2>/dev/null)" || { fastup_resolve_error self 'asset fastup has no checksum'; return 1; }
-      url="$(printf '%s' "$metadata" | /usr/bin/plutil -extract "assets.$index.browser_download_url" raw -o - - 2>/dev/null)" || { fastup_resolve_error self 'asset fastup has no download URL'; return 1; }
+      digest="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.digest" - 2>/dev/null)" || { fastup_resolve_error self 'asset fastup has no checksum'; return 1; }
+      url="$(printf '%s' "$metadata" | fastup_json_get "assets.$index.browser_download_url" - 2>/dev/null)" || { fastup_resolve_error self 'asset fastup has no download URL'; return 1; }
       break
     fi
     index=$((index + 1))
@@ -956,15 +1049,19 @@ self_resolve() {
 }
 
 self_install() {
+  FASTUP_CLEANUP_SELF_TMP=
   local payload="$1" tmp
   [ "$("$BASH" "$payload" --version 2>/dev/null)" = "fastup $LATEST" ] || {
     printf 'self: downloaded script does not report version %s\n' "$LATEST" >&2; return 1;
   }
   tmp="$(mktemp "${SELF_TARGET%/*}/.fastup.XXXXXX")" || { printf 'self: cannot create temp file in %s\n' "${SELF_TARGET%/*}" >&2; return 1; }
+  FASTUP_CLEANUP_SELF_TMP="$tmp"
   if cp "$payload" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$SELF_TARGET"; then
+    FASTUP_CLEANUP_SELF_TMP=
     printf 'self: updated %s -> %s\n' "$FASTUP_VERSION" "$LATEST"
   else
     rm -f "$tmp"
+    FASTUP_CLEANUP_SELF_TMP=
     printf 'self: cannot replace %s\n' "$SELF_TARGET" >&2
     return 1
   fi

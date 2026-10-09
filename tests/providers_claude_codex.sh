@@ -14,7 +14,21 @@
 #           standalone codex binary's `update`), then requires current -> the staged dir and --version == v.
 #   npm candidates are disabled here by pointing FASTUP_NPM_REGISTRY at a 404.
 
-case "$(uname -m)" in arm64) CL_PLAT=darwin-arm64; CX_TARGET=aarch64-apple-darwin ;; *) CL_PLAT=darwin-x64; CX_TARGET=x86_64-apple-darwin ;; esac
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) CL_PLAT=darwin-arm64; CX_TARGET=aarch64-apple-darwin ;;
+  Darwin:x86_64|Darwin:amd64) CL_PLAT=darwin-x64; CX_TARGET=x86_64-apple-darwin ;;
+  Linux:arm64|Linux:aarch64)
+    CX_TARGET=aarch64-unknown-linux-musl
+    if ldd --version 2>&1 | head -n 1 | grep -qi musl; then CL_PLAT=linux-arm64-musl
+    else CL_PLAT=linux-arm64; fi
+    ;;
+  Linux:x86_64|Linux:amd64)
+    CX_TARGET=x86_64-unknown-linux-musl
+    if ldd --version 2>&1 | head -n 1 | grep -qi musl; then CL_PLAT=linux-x64-musl
+    else CL_PLAT=linux-x64; fi
+    ;;
+  *) echo "unsupported test platform: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
 
 # --- claude fixtures -----------------------------------------------------------
 claude_release() { # <version> [<binary-version-output>]
@@ -119,6 +133,10 @@ codex_home() { # <installed-version> -> sets XHOME (CODEX_HOME) and SROOT
 
 # Stand-in for the official `codex update`: switches current to the staged dir if it is complete.
 SWITCH_CMD='d="$CODEX_HOME/packages/standalone/releases/0.161.0-'"$CX_TARGET"'"; [ -x "$d/bin/codex" ] && ln -sfn "$d" "$CODEX_HOME/packages/standalone/current"'
+if [ "$(uname -s)" = Linux ]; then
+  # The official updater must be able to acquire its lock after fastup has staged the release.
+  SWITCH_CMD='exec 9>"$CODEX_HOME/packages/standalone/install.lock"; flock -n 9 || exit 1; '"$SWITCH_CMD"
+fi
 
 fu_codex() {
   CODEX_HOME="$XHOME" HOME="$XHOME" FASTUP_CODEX_RELEASES="$BASE/codex" FASTUP_CODEX_GITHUB="$BASE/no-gh" \
@@ -166,7 +184,7 @@ t_all_skips_not_installed() {
   empty="$(mktemp -d "$WORK/empty.XXXXXX")"
   HOME="$empty" CODEX_HOME="$empty/.codex" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" \
     FASTUP_OMP_API="$BASE/omp/latest.json" FASTUP_CLAUDE_BASE="$BASE/claude" FASTUP_CODEX_RELEASES="$BASE/codex" \
-    FASTUP_AGY_MANIFEST="$BASE/agy/darwin_$AGY_ARCH.json" FASTUP_NPM_REGISTRY="$BASE/no-npm" \
+    FASTUP_AGY_MANIFEST="$BASE/agy/$AGY_MANIFEST_FILE" FASTUP_NPM_REGISTRY="$BASE/no-npm" \
     FASTUP_GH_PROXIES="" FASTUP_PROXIES="" FASTUP_STATE="$empty/state" \
     "${TEST_BASH:-/bin/bash}" "$FASTUP" all >"$WORK/out" 2>&1; rc=$?
   [ $rc -eq 0 ] && grep -q 'claude: not installed' "$WORK/out" && grep -q 'agy: not installed' "$WORK/out" &&

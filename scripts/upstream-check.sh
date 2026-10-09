@@ -1,7 +1,8 @@
 #!/bin/bash
 # Live check against the real upstreams: for each CLI, resolve the latest release from its official
-# metadata, probe every candidate source, then download and checksum-verify the fastest one.
-# Catches upstream changes (renamed assets, moved manifests, new archive layouts) before users do.
+# metadata, probe every candidate source, then download and checksum-verify the fastest one while
+# requiring the provider-declared payload path to exist. It does not execute payloads or validate
+# every archive entry, so it does not claim full archive-layout coverage.
 # Usage: scripts/upstream-check.sh [cli...]   (default: claude codex omp agy)
 set -u
 FASTUP="$(cd "$(dirname "$0")/.." && pwd)/fastup"

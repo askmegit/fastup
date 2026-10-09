@@ -2,7 +2,7 @@
 class Fastup < Formula
   desc "Probe download sources and update AI coding CLIs from the fastest, checksum-verified one"
   homepage "https://github.com/askmegit/fastup"
-  version "0.2.0"
+  version "0.3.0"
   # sha256 is filled at release time from the release asset digest.
   url "https://github.com/askmegit/fastup/releases/download/v#{version}/fastup"
   sha256 "REPLACE_WITH_RELEASE_SHA256"

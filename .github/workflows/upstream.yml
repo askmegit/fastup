@@ -1,6 +1,9 @@
 name: upstream
 # Daily live check: resolve, probe and download+verify every CLI from its real upstream, so an
-# upstream change (renamed asset, moved manifest, new layout) is noticed before users hit it.
+# upstream change (renamed asset, moved manifest, or checksum) is noticed before users hit it.
+# GitHub disables public scheduled workflows after 60 days without repository activity. The
+# separate recovery workflow re-enables this one after real main-branch activity or a manual run;
+# no scheduled workflow can wake itself while the repository remains inactive.
 on:
   schedule:
     - cron: '17 3 * * *'
@@ -12,7 +15,7 @@ jobs:
   check:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Check upstreams
         id: check
         env:

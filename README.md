@@ -2,17 +2,17 @@
 
 fastup updates AI coding CLIs (Claude Code, Codex, oh-my-pi, Antigravity) from a single command. Download speed to the official hosts varies a lot by network, so fastup probes every candidate source (the official host, npm mirrors, optional GitHub accelerator prefixes) by fetching the first 2 MiB of each, picks the fastest, and downloads from it. Partial downloads resume on another source if one stalls. Whatever source supplies the bytes, fastup installs them only if they match the checksum published by the official host.
 
-macOS only in v0.1. Bash 3.2 compatible. Needs `curl`, `shasum`, `tar`, `openssl` and `/usr/bin/plutil` (all ship with macOS). No `jq`.
+Supports macOS and Linux on x86_64 / arm64 where the upstream CLI publishes a matching binary. Bash 3.2 compatible. Needs `curl`, `tar`, `openssl`, and either `shasum` or `sha256sum` / `sha512sum`. JSON metadata uses `/usr/bin/plutil` on macOS and Python 3 on Linux. No `jq`.
 
 ## Install
 
-Homebrew:
+Homebrew (macOS):
 
 ```bash
 brew install askmegit/tap/fastup
 ```
 
-One-liner (installs to `~/.local/bin`, override with `FASTUP_INSTALL_DIR`):
+One-liner (macOS or Linux; installs to `~/.local/bin`, override with `FASTUP_INSTALL_DIR`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/askmegit/fastup/main/install.sh | bash
@@ -66,14 +66,20 @@ Version numbers and checksums are fetched only from official hosts, never throug
 | omp | `api.github.com` |
 | agy | the Antigravity `run.app` update manifest |
 
+## Measured example
+
+On one macOS network on 2026-10-08, a Codex update selected an npm mirror after probing the available sources. Downloading the 129 MB package took about 7 seconds; updating Claude and Codex together took about 48 seconds, including metadata checks and installation. GitHub direct probes on that network were around 35–63 KB/s.
+
+These are observations from one run, not a speed guarantee or a controlled comparison of the same artifact. fastup probes again on each update because routes and source performance change. Antigravity's Google Cloud Storage download varies independently; the tested public GitHub accelerators did not provide a working route for it. Supply a compatible prefix with `FASTUP_PROXIES` to include it in agy's next probe.
+
 ## Supported install layouts
 
 | CLI | Layout |
 | --- | --- |
 | claude | Native installer: `~/.local/bin/claude` -> `~/.local/share/claude/versions/<v>`. Follows `autoUpdatesChannel` in `~/.claude/settings.json`. |
 | codex | Standalone installer (`~/.codex/packages/standalone`). fastup pre-stages the verified release, then runs the official `codex update`, which skips its own download. |
-| omp | Single Mach-O binary on `PATH`. |
-| agy | Single Mach-O binary on `PATH`. |
+| omp | Single native binary on `PATH` (Mach-O on macOS, ELF on Linux). |
+| agy | Single native binary on `PATH` (Mach-O on macOS, ELF on Linux). |
 
 Exit 3 means the tool was found but installed some other way (Homebrew, npm, ...). fastup does not touch it; update it with the package manager that installed it.
 
@@ -94,8 +100,18 @@ Exit 3 means the tool was found but installed some other way (Homebrew, npm, ...
 
 ## Limitations
 
-- macOS only in v0.1.
+- Linux requires Python 3 for metadata and `flock` (util-linux) for Codex installation. The Homebrew formula currently targets macOS; use the installer script on Linux.
 - Public GitHub accelerators are third-party services and may disappear or change. Set `FASTUP_GH_PROXIES` to your own list (or empty to disable them); checksum verification keeps a bad source from being installed, but a dead one only costs probe time.
+
+## Upstream checks
+
+The `upstream` GitHub Actions workflow checks real upstream downloads daily and can also run manually. GitHub may disable scheduled workflows in public repositories after 60 days without repository activity. A separate recovery workflow re-enables the schedule on a push to `main`, or when manually dispatched:
+
+```bash
+gh workflow run upstream-recovery.yml --repo askmegit/fastup
+```
+
+This does not keep an idle repository alive by itself. If the schedule is already disabled and no push occurs, a maintainer must run the recovery workflow (or use an external scheduler). See [GitHub's scheduled workflow documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
 ## License
 

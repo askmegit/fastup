@@ -29,8 +29,14 @@ failed=()
 ok() { pass=$((pass + 1)); printf '  ok   %s\n' "$1"; }
 bad() { fail=$((fail + 1)); failed+=("$1"); printf '  FAIL %s: %s\n' "$1" "$2"; }
 
-sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
-sha512() { shasum -a 512 "$1" | cut -d' ' -f1; }
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else sha256sum "$1" | awk '{print $1}'; fi
+}
+sha512() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 512 "$1" | awk '{print $1}'
+  else sha512sum "$1" | awk '{print $1}'; fi
+}
 
 # --- fixtures --------------------------------------------------------------
 head -c $((3 * 1024 * 1024)) /dev/urandom >"$ROOT/good.bin"
@@ -50,7 +56,7 @@ printf 'pwned\n' >"$WORK/trav/evil"
 TRAV512="$(sha512 "$ROOT/trav.tgz")"
 
 # npm registry metadata fixture (official registry + one mirror serve the same tarball)
-INTEGRITY="sha512-$(openssl dgst -sha512 -binary "$ROOT/good.tgz" | base64 | tr -d '\n')"
+INTEGRITY="sha512-$(python3 -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()).digest()).decode())' "$ROOT/good.tgz")"
 mkdir -p "$ROOT/npm/@scope/pkg/-" "$ROOT/mirror/@scope/pkg/-"
 cp "$ROOT/good.tgz" "$ROOT/npm/@scope/pkg/-/pkg-1.2.3.tgz"
 cp "$ROOT/good.tgz" "$ROOT/mirror/@scope/pkg/-/pkg-1.2.3.tgz"
@@ -85,6 +91,18 @@ t_cli_unknown() {
 t_sourcing_is_quiet() {
   out="$(lib 'true' 2>&1)"
   [ -z "$out" ] && ok sourcing_is_quiet || bad sourcing_is_quiet "sourcing printed: $out"
+}
+
+t_json_accessor_validates() {
+  json="$WORK/json.json"
+  printf '{"assets":[{"name":"fastup","digest":"sha256:abc"}]}\n' >"$json"
+  got="$(lib "fastup_json_get assets.0.name '$json'")"; valid_rc=$?
+  lib "fastup_json_get assets '$json'" >/dev/null 2>&1; object_rc=$?
+  lib "fastup_json_get assets.1.name '$json'" >/dev/null 2>&1; missing_rc=$?
+  printf '{"assets": [}\n' >"$json"
+  lib "fastup_json_get assets.0.name '$json'" >/dev/null 2>&1; invalid_rc=$?
+  [ "$valid_rc" -eq 0 ] && [ "$got" = fastup ] && [ "$object_rc" -ne 0 ] && [ "$missing_rc" -ne 0 ] && [ "$invalid_rc" -ne 0 ] &&
+    ok json_accessor_validates || bad json_accessor_validates "valid=$valid_rc value=$got missing=$missing_rc invalid=$invalid_rc"
 }
 
 # --- core: probe -------------------------------------------------------------

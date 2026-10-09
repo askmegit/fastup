@@ -4,12 +4,24 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install shellcheck
-        run: command -v shellcheck >/dev/null || brew install shellcheck
+        shell: bash
+        run: |
+          command -v shellcheck >/dev/null 2>&1 && exit 0
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install shellcheck
+          else
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
       - name: shellcheck
         run: shellcheck -x fastup install.sh
-      - name: Tests (bash 3.2)
+      - name: Tests (bash)
         run: /bin/bash tests/run.sh

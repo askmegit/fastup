@@ -7,13 +7,27 @@
 #   FASTUP_GH_PROXIES="" / FASTUP_PROXIES=""  -> no accelerator candidates
 #   the target is whatever `command -v omp|agy` resolves to on PATH.
 
-# A tiny Mach-O that prints a fixed version string.
+# A tiny native executable that prints a fixed version string.
 mkbin() { # <out> <version-output>
   printf '#include <stdio.h>\nint main(void){puts("%s");return 0;}\n' "$2" >"$WORK/v.c"
   cc -o "$1" "$WORK/v.c" 2>/dev/null
 }
 
-case "$(uname -m)" in arm64) OMP_ASSET=omp-darwin-arm64; AGY_ARCH=arm64 ;; *) OMP_ASSET=omp-darwin-x64; AGY_ARCH=amd64 ;; esac
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) OMP_ASSET=omp-darwin-arm64; AGY_MANIFEST_FILE=darwin_arm64.json ;;
+  Darwin:x86_64|Darwin:amd64) OMP_ASSET=omp-darwin-x64; AGY_MANIFEST_FILE=darwin_amd64.json ;;
+  Linux:arm64|Linux:aarch64)
+    AGY_MANIFEST_FILE=linux_arm64.json
+    if ldd --version 2>&1 | head -n 1 | grep -qi musl; then OMP_ASSET=omp-linux-musl-arm64
+    else OMP_ASSET=omp-linux-arm64; fi
+    ;;
+  Linux:x86_64|Linux:amd64)
+    AGY_MANIFEST_FILE=linux_amd64.json
+    if ldd --version 2>&1 | head -n 1 | grep -qi musl; then OMP_ASSET=omp-linux-musl-x64
+    else OMP_ASSET=omp-linux-x64; fi
+    ;;
+  *) echo "unsupported test platform: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
 
 mkdir -p "$ROOT/omp" "$ROOT/agy/pkg"
 mkbin "$ROOT/omp/$OMP_ASSET" "omp/18.8.4"
@@ -33,7 +47,7 @@ mkbin "$ROOT/agy/wrongpkg/antigravity" "0.0.1"
 tar -czf "$ROOT/agy/wrong.tar.gz" -C "$ROOT/agy/wrongpkg" antigravity
 AGYWRONG512="$(sha512 "$ROOT/agy/wrong.tar.gz")"
 agy_manifest() { # <version> <url> <sha512>
-  printf '{"version":"%s","url":"%s","sha512":"%s"}\n' "$1" "$2" "$3" >"$ROOT/agy/darwin_$AGY_ARCH.json"
+  printf '{"version":"%s","url":"%s","sha512":"%s"}\n' "$1" "$2" "$3" >"$ROOT/agy/$AGY_MANIFEST_FILE"
 }
 
 # Fresh fake install: <cli> <version-output> -> sets BIN (dir on PATH) and TARGET
@@ -43,9 +57,21 @@ fake_install() {
   mkbin "$TARGET" "$2"
 }
 
+t_native_binary_layout() {
+  omp_release v18.8.4 "$BASE/omp/$OMP_ASSET" "$OMP_NEW256"
+  fake_install omp "omp/18.8.4"
+  fu --check omp >/dev/null 2>&1; rc=$?
+  magic="$(od -An -tx1 -N4 "$TARGET" | tr -d ' \n')"
+  case "$(uname -s):$magic" in
+    Darwin:cffaedfe|Darwin:cefaedfe|Darwin:cafebabe|Linux:7f454c46) ;;
+    *) rc=1 ;;
+  esac
+  [ "$rc" -eq 0 ] && ok native_binary_layout || bad native_binary_layout "rc=$rc magic=$magic"
+}
+
 fu() { # run fastup with the fake install first on PATH
   PATH="$BIN:$PATH" FASTUP_OMP_API="$BASE/omp/latest.json" \
-    FASTUP_AGY_MANIFEST="$BASE/agy/darwin_$AGY_ARCH.json" \
+    FASTUP_AGY_MANIFEST="$BASE/agy/$AGY_MANIFEST_FILE" \
     FASTUP_GH_PROXIES="" FASTUP_PROXIES="" "${TEST_BASH:-/bin/bash}" "$FASTUP" "$@"
 }
 

@@ -7,13 +7,27 @@ main() {
   REPO="askmegit/fastup"
   API="https://api.github.com/repos/$REPO/releases/latest"
   INSTALL_DIR="${FASTUP_INSTALL_DIR:-$HOME/.local/bin}"
-  PLUTIL=/usr/bin/plutil
   PROXIES="${FASTUP_GH_PROXIES-https://gh-proxy.com/ https://ghfast.top/ https://gh.llkk.cc/ https://ghproxy.net/}"
 
   die() { echo "install.sh: $*" >&2; exit 1; }
 
-  [ "$(uname -s)" = Darwin ] || die "macOS only"
-  [ -x "$PLUTIL" ] || die "$PLUTIL not found"
+  case "$(uname -s)" in
+    Darwin)
+      PLUTIL=/usr/bin/plutil
+      [ -x "$PLUTIL" ] || die "$PLUTIL not found"
+      ;;
+    Linux)
+      command -v python3 >/dev/null 2>&1 || die "python3 is required on Linux for JSON metadata"
+      ;;
+    *) die "unsupported operating system: $(uname -s)" ;;
+  esac
+  if command -v shasum >/dev/null 2>&1; then
+    sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+  else
+    die "shasum or sha256sum not found"
+  fi
 
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
@@ -28,7 +42,25 @@ main() {
       -o "$tmp/release.json" "$API" || die "cannot fetch $API"
   fi
 
-  json_get() { "$PLUTIL" -extract "$1" raw -o - "$tmp/release.json" 2>/dev/null; }
+  if [ "$(uname -s)" = Darwin ]; then
+    json_get() { "$PLUTIL" -extract "$1" raw -expect string -o - "$tmp/release.json" 2>/dev/null; }
+  else
+    json_get() {
+      python3 -c '
+import json
+import sys
+
+path = sys.argv[1]
+with open(sys.argv[2]) as handle:
+    value = json.load(handle)
+for part in path.split("."):
+    value = value[int(part)] if isinstance(value, list) else value[part]
+if not isinstance(value, str):
+    raise ValueError("JSON value is not a string")
+sys.stdout.write(value)
+' "$1" "$tmp/release.json"
+    }
+  fi
 
   url="" digest="" i=0
   while name="$(json_get "assets.$i.name")"; do
@@ -49,7 +81,7 @@ main() {
   try_download() {
     rm -f "$tmp/fastup"
     curl -fsSL --connect-timeout 10 -o "$tmp/fastup" "$1" 2>/dev/null || return 1
-    got="$(shasum -a 256 "$tmp/fastup" | awk '{print $1}')"
+    got="$(sha256_file "$tmp/fastup")"
     [ "$got" = "$want" ]
   }
 
@@ -57,7 +89,7 @@ main() {
   # A logged-in gh can also fetch assets of private releases, which the plain URL cannot.
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 &&
     gh release download --repo "$REPO" --pattern fastup --dir "$tmp" --clobber >/dev/null 2>&1 &&
-    [ "$(shasum -a 256 "$tmp/fastup" | awk '{print $1}')" = "$want" ]; then
+    [ "$(sha256_file "$tmp/fastup")" = "$want" ]; then
     ok=1
   elif try_download "$url"; then
     ok=1

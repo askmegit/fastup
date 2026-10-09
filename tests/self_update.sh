@@ -44,6 +44,32 @@ t_self_updates() {
     bad self_updates "rc=$rc now=$(self_version) out=$(tail -3 "$WORK/out" | tr '\n' '|') dir=$(ls -A "$(dirname "$SELF")" | tr '\n' ' ')"
 }
 
+t_self_interrupt_cleans_temp() {
+  self_release v9.9.9 "$BASE/self/fastup" "$SELF_NEW256"
+  self_copy
+  self_dir="$(cd "$(dirname "$SELF")" && pwd -P)"
+  before="$(sha256 "$SELF")"
+  marker="$WORK/self-copy.marker"
+  slow_bin="$(mktemp -d "$WORK/slow-cp.XXXXXX")"
+  printf '#!/bin/sh\nlast=\nfor arg do last="$arg"; done\n/bin/cp "$@"\ncase "$last" in\n  "$FASTUP_SELF_TMP_DIR"/.fastup.*) : >"$FASTUP_SELF_TMP_MARKER"; sleep 30 ;;\nesac\n' >"$slow_bin/cp"
+  chmod 755 "$slow_bin/cp"
+  FASTUP_SELF_API="$BASE/self/latest.json" FASTUP_GH_PROXIES="" FASTUP_PROXIES="" \
+    FASTUP_STATE="$WORK/self-state" FASTUP_SELF_TMP_DIR="$self_dir" FASTUP_SELF_TMP_MARKER="$marker" \
+    PATH="$slow_bin:$PATH" "${TEST_BASH:-/bin/bash}" "$SELF" self >"$WORK/out" 2>&1 &
+  pid=$!
+  for _ in $(seq 100); do [ -e "$marker" ] && break; sleep 0.1; done
+  if [ -e "$marker" ]; then
+    pkill -TERM -P "$pid" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null
+  else
+    kill -TERM "$pid" 2>/dev/null
+  fi
+  wait "$pid" 2>/dev/null
+  left="$(find "$self_dir" -mindepth 1 ! -name fastup -print)"
+  [ -e "$marker" ] && [ "$(sha256 "$SELF")" = "$before" ] && [ -z "$left" ] && ok self_interrupt_cleans_temp ||
+    bad self_interrupt_cleans_temp "marker=$([ -e "$marker" ] && echo yes || echo no) original=$([ "$(sha256 "$SELF")" = "$before" ] && echo unchanged || echo changed) left=$(printf '%s' "$left" | tr '\n' ' ')"
+}
+
 t_self_follows_symlink() {
   self_release v9.9.9 "$BASE/self/fastup" "$SELF_NEW256"
   self_copy
